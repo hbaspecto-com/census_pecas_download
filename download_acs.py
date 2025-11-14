@@ -34,11 +34,42 @@ def make_geoid(df):
     # All are strings from API; zero-padding preserved already
     return (df["state"] + df["county"] + df["tract"] + df["block group"])
 
-def fetch_table(table):
+def fetch_table(table, geoid_list=None):
+    """
+    Fetch ACS table data for block groups.
+    
+    Args:
+        table: ACS table name (e.g., "B25024")
+        geoid_list: Optional list of GEOIDs to fetch data for. If provided, only these
+                    block groups will be fetched. If None, fetches all block groups in arc_counties.
+    
+    Returns:
+        DataFrame with GEOID and ACS variables
+    """
     vars_all = get_variables(table)
     rows = []
+    
+    # If geoid_list provided, organize by county for efficient querying
+    if geoid_list is not None:
+        # Group GEOIDs by county
+        county_bgs = {}
+        for geoid in geoid_list:
+            if len(geoid) >= 5:
+                county_code = geoid[2:5]
+                if county_code not in county_bgs:
+                    county_bgs[county_code] = []
+                # Extract tract and block group
+                if len(geoid) >= 12:
+                    tract = geoid[5:11]
+                    bg = geoid[11:12]
+                    county_bgs[county_code].append((tract, bg))
+        
+        counties_to_fetch = list(county_bgs.keys())
+    else:
+        counties_to_fetch = arc_counties
+        county_bgs = None
 
-    for county in arc_counties:
+    for county in counties_to_fetch:
         print(f"  County {county}...")
 
         # Collect chunks and merge them later
@@ -73,16 +104,27 @@ def fetch_table(table):
                     time.sleep(2)
 
         # Merge all chunks horizontally
-        df_merged = df_chunks[0]
-        for part in df_chunks[1:]:
-            df_merged = df_merged.merge(
-                part.drop(columns=["NAME"]),
-                on=["state","county","tract","block group"],
-                how="left"
-            )
+        if df_chunks:
+            df_merged = df_chunks[0]
+            for part in df_chunks[1:]:
+                df_merged = df_merged.merge(
+                    part.drop(columns=["NAME"]),
+                    on=["state","county","tract","block group"],
+                    how="left"
+                )
 
-        rows.append(df_merged)
+            # If geoid_list provided, filter to only those block groups
+            if county_bgs is not None and county in county_bgs:
+                df_merged["temp_geoid"] = make_geoid(df_merged)
+                target_geoids = [f"{state}{county}{tract}{bg}" for tract, bg in county_bgs[county]]
+                df_merged = df_merged[df_merged["temp_geoid"].isin(target_geoids)]
+                df_merged = df_merged.drop(columns=["temp_geoid"])
 
+            rows.append(df_merged)
+
+    if not rows:
+        return pd.DataFrame()
+    
     out = pd.concat(rows, ignore_index=True)
     out["GEOID"] = make_geoid(out)
     # Optional: reorder GEOID first
@@ -376,18 +418,24 @@ if __name__ == "__main__":
     download_dir = "downloads"
     os.makedirs(download_dir, exist_ok=True)
 
-    if not geom_only:
-        # 1) Data tables
-        for table, label in tables.items():
-            print(f"Downloading {table} ({label}) ...")
-            df = fetch_table(table)
-            save_csv(df, f"ARC_{label}_2023_BG.csv")
-    else:
-        print("Skipping ACS tables (geom-only mode).")
-
-    # 2) Geometries
+    # 1) First, download geometries to get the definitive list of block groups
+    print("Downloading block group geometries...")
     geom_df = fetch_blockgroup_geometries(state = state, arc_counties = arc_counties)
     save_csv(geom_df, "ARC_BG_Geometries_2023.csv")
+    
+    # Extract the list of GEOIDs from geometries
+    geoid_list = geom_df["GEOID"].tolist() if not geom_df.empty else []
+    print(f"Found {len(geoid_list)} block groups from geometry download.")
+
+    if not geom_only:
+        # 2) Data tables - fetch only for the GEOIDs we have geometries for
+        for table, label in tables.items():
+            print(f"Downloading {table} ({label}) for {len(geoid_list)} block groups...")
+            df = fetch_table(table, geoid_list=geoid_list)
+            save_csv(df, f"ARC_{label}_2023_BG.csv")
+            print(f"  Downloaded {len(df)} rows for {label}")
+    else:
+        print("Skipping ACS tables (geom-only mode).")
 
     # 3) Emit PostGIS loading instructions (prints to console)
     db_url = os.environ.get("POSTGRES_URL", "")

@@ -2,6 +2,7 @@ import requests
 import pandas as pd
 import time
 import os
+import sys
 from urllib.parse import quote_plus
 
 arc_counties = [
@@ -94,56 +95,137 @@ def fetch_blockgroup_geometries():
     via the TIGERweb MapServer identify endpoint (per-county), then flatten to a table
     with WKT geometry for easy PostGIS copy.
     """
-    # TIGERweb layer: Census 2020 Block Groups (Layer 8 in Census2020/tracts_blocks)
-    # Endpoint supports where=STATE='13' AND COUNTY='xxx'
-    # We'll use the feature server style query endpoint for GeoJSON output.
-    base = "https://tigerweb.geo.census.gov/arcgis/rest/services/Census2020/Tracts_Blocks/MapServer/8/query"
+    # Layer 10 = Census Block Groups
+    base = "https://tigerweb.geo.census.gov/arcgis/rest/services/Census2020/Tracts_Blocks/MapServer/10/query"
 
     records = []
+    total_kept = 0
 
     for county in arc_counties:
+        # Use fields that exist on layer 10: STATE and COUNTY
         params = {
             "where": f"STATE='{state}' AND COUNTY='{county}'",
-            "outFields": "STATE,COUNTY,TRACT,BLOCK_GROUP,GEOID",
+            "outFields": "*",
+            "returnGeometry": "true",
             "f": "geojson",
             "outSR": "4326",
-            "geometryType": "esriGeometryEnvelope",
-            "returnGeometry": "true"
+            "resultRecordCount": 2000,
+            "resultOffset": 0,
+            "returnExceededLimitFeatures": "true"
         }
         print(f"Downloading geometry for county {county} ...")
-        resp = requests.get(base, params=params, timeout=60)
-        if resp.status_code != 200:
-            print(f"  Geometry API error {resp.status_code}: {resp.text[:200]}")
+        try:
+            resp = requests.get(base, params=params, timeout=60)
+        except Exception as ex:
+            print(f"  Request error for county {county}: {ex}")
             continue
 
-        gj = resp.json()
+        if resp.status_code != 200:
+            print(f"  Geometry HTTP error {resp.status_code}")
+            try:
+                errj = resp.json()
+                if isinstance(errj, dict) and "error" in errj:
+                    e = errj["error"]
+                    print(f"    ArcGIS error code={e.get('code')} message={e.get('message')}")
+                    if e.get("details"):
+                        print(f"  details: {e['details']}")
+                else:
+                    print(f"    body (json): {errj}")
+            except Exception:
+                print(f"    body (text): {resp.text[:300]}")
+            continue
+
+        try:
+            gj = resp.json()
+        except Exception as ex:
+            print(f"  Geometry parse error: {ex}; body: {resp.text[:300]}")
+            continue
+
+        if isinstance(gj, dict) and "error" in gj:
+            e = gj["error"]
+            print(f"  ArcGIS payload error code={e.get('code')} message={e.get('message')}")
+            if e.get("details"):
+                print(f"  details: {e['details']}")
+            continue
+
         feats = gj.get("features", [])
+        print(f"  features returned: {len(feats)}")
+        if not feats:
+            continue
+
+        sample_props = feats[0].get("properties") or {}
+        if sample_props:
+            print(f"  sample keys: {sorted(list(sample_props.keys()))[:10]}")
+
         for feat in feats:
-            props = feat.get("properties", {})
+            props = feat.get("properties") or {}
             geom = feat.get("geometry")
-            # Build keys and simple WKT (without external libs)
-            # Geometry can be Polygon or MultiPolygon
+            if not geom or geom.get("type") not in ("Polygon", "MultiPolygon"):
+                continue
+
             wkt = geojson_to_wkt(geom)
-            # GEOID: use provided if available; else compose
-            geoid = props.get("GEOID") or (props["STATE"] + props["COUNTY"] + props["TRACT"] + str(props["BLOCK_GROUP"]))
+            if not wkt:
+                continue
+
+            geoid = str(
+                props.get("GEOID")
+                or props.get("GEOID10")
+                or props.get("BG_GEOID")
+                or ""
+            ).strip()
+
+            # On layer 10 the fields are STATE, COUNTY, TRACT, BLOCK_GROUP
+            st = (props.get("STATE") or "").strip()
+            co = (props.get("COUNTY") or "").strip()
+            tr = (props.get("TRACT") or "").strip()
+            bg = (props.get("BLOCK_GROUP") or "").strip()
+            # If components missing, try to derive from GEOID by keeping only digits
+            if (not st or not co or not tr or not bg) and geoid:
+                geoid_digits = "".join(ch for ch in geoid if ch.isdigit())
+                if len(geoid_digits) >= 12:
+                    st = st or geoid_digits[0:2]
+                    co = co or geoid_digits[2:5]
+                    tr = tr or geoid_digits[5:11]
+                    bg = bg or geoid_digits[11:12]
+
+            if not (st and co and tr and bg):
+                continue
+
+            # Zero-pad safety
+            if st.isdigit() and len(st) < 2:
+                st = st.zfill(2)
+            if co.isdigit() and len(co) < 3:
+                co = co.zfill(3)
+            if tr.isdigit() and len(tr) < 6:
+                tr = tr.zfill(6)
+
+            if not geoid:
+                geoid = f"{st}{co}{tr}{bg}"
+
             records.append({
                 "GEOID": geoid,
-                "STATE": props.get("STATE"),
-                "COUNTY": props.get("COUNTY"),
-                "TRACT": props.get("TRACT"),
-                "BLOCK_GROUP": str(props.get("BLOCK_GROUP")),
+                "STATE": st,
+                "COUNTY": co,
+                "TRACT": tr,
+                "BLOCK_GROUP": bg,
                 "wkt": wkt
             })
+            total_kept += 1
+
+        print(f"Total geometries kept: {total_kept}")
 
     gdf = pd.DataFrame.from_records(records)
-    # Normalize naming to match ACS table joins
+    if gdf.empty:
+        print("No rows made it into the output after filtering.")
+        gdf = pd.DataFrame(columns=["GEOID","STATE","COUNTY","TRACT","BLOCK_GROUP","wkt"])
+
     gdf.rename(columns={
         "STATE": "state",
         "COUNTY": "county",
         "TRACT": "tract",
         "BLOCK_GROUP": "block group"
     }, inplace=True)
-    # Ensure GEOID alignment (strings)
+
     gdf["GEOID"] = gdf["GEOID"].astype(str)
     return gdf[["GEOID","state","county","tract","block group","wkt"]]
 
@@ -156,19 +238,47 @@ def geojson_to_wkt(geom):
         return None
     gtype = geom.get("type")
     coords = geom.get("coordinates")
+
+    def xy_tuple(pt):
+        # Accept [x,y] or [x,y,z]
+        try:
+            x, y = pt[0], pt[1]
+            return x, y
+        except Exception:
+            return None
+
     if gtype == "Polygon":
         rings = []
-        for ring in coords:
-            rings.append("(" + ", ".join(f"{x} {y}" for x, y in ring) + ")")
-        return "POLYGON(" + ", ".join(rings) + ")"
+        for ring in coords or []:
+            pts = []
+            for pt in ring:
+                xy = xy_tuple(pt)
+                if xy is None:
+                    continue
+                x, y = xy
+                pts.append(f"{x} {y}")
+            if not pts:
+                continue
+            rings.append("(" + ", ".join(pts) + ")")
+        return "POLYGON(" + ", ".join(rings) + ")" if rings else None
     elif gtype == "MultiPolygon":
         polys = []
-        for poly in coords:
+        for poly in coords or []:
             rings = []
             for ring in poly:
-                rings.append("(" + ", ".join(f"{x} {y}" for x, y in ring) + ")")
-            polys.append("(" + ", ".join(rings) + ")")
-        return "MULTIPOLYGON(" + ", ".join(polys) + ")"
+                pts = []
+                for pt in ring:
+                    xy = xy_tuple(pt)
+                    if xy is None:
+                        continue
+                    x, y = xy
+                    pts.append(f"{x} {y}")
+                if not pts:
+                    continue
+                rings.append("(" + ", ".join(pts) + ")")
+            if rings:
+                polys.append("(" + ", ".join(rings) + ")")
+        return "MULTIPOLYGON(" + ", ".join(polys) + ")" if polys else None
     else:
         return None
 
@@ -245,22 +355,27 @@ def save_csv(df, path):
     df.to_csv(path, index=False)
 
 # Download and save all tables
+
+
 if __name__ == "__main__":
     os.makedirs(".", exist_ok=True)
 
-    # 1) Data tables
-    for table, label in tables.items():
-        print(f"Downloading {table} ({label}) ...")
-        df = fetch_table(table)
-        save_csv(df, f"ARC_{label}_2023_BG.csv")
+    geom_only = "--geom-only" in sys.argv
+
+    if not geom_only:
+        # 1) Data tables
+        for table, label in tables.items():
+            print(f"Downloading {table} ({label}) ...")
+            df = fetch_table(table)
+            save_csv(df, f"ARC_{label}_2023_BG.csv")
+    else:
+        print("Skipping ACS tables (geom-only mode).")
 
     # 2) Geometries
     geom_df = fetch_blockgroup_geometries()
     save_csv(geom_df, "ARC_BG_Geometries_2023.csv")
 
     # 3) Emit PostGIS loading instructions (prints to console)
-    # Provide your DB URL to get ready-to-run SQL/COPY steps:
-    # Example: db_url = "postgresql://user:pass@localhost:5432/mydb"
     db_url = os.environ.get("POSTGRES_URL", "")
     to_postgis_instructions(db_url or "<postgresql://user:pass@host:port/dbname>", schema="public")
 

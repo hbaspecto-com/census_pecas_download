@@ -1,0 +1,159 @@
+export PGHOST=leduc.office.hbaspecto.com
+export PGDATABASE=atlanta_db
+export PGUSER=postgres
+
+PostGIS load instructions:
+1) In psql, create base tables and enable PostGIS (once):
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE SCHEMA IF NOT EXISTS public;
+
+-- Geometry base table
+DROP TABLE IF EXISTS acs_5yr_2023.arc_bg_geom_2023 CASCADE;
+CREATE TABLE acs_5yr_2023.arc_bg_geom_2023 (
+  geoid text PRIMARY KEY,
+  state text,
+  county text,
+  tract text,
+  block_group text,
+  wkt text
+);
+
+2) COPY geometry CSV into Postgres, then add geometry column:
+-- Adjust path as needed
+\copy acs_5yr_2023.arc_bg_geom_2023 (geoid,state,county,tract,block_group,wkt) FROM '/nfs/home/sja/repos/census_pecas_download/ARC_BG_Geometries_2023.csv' WITH (FORMAT csv, HEADER true);
+
+-- Create geometry column from WKT and index
+ALTER TABLE acs_5yr_2023.arc_bg_geom_2023 ADD COLUMN geom geometry(MultiPolygon, 4326);
+-- Handle both Polygon and MultiPolygon using ST_Multi
+UPDATE acs_5yr_2023.arc_bg_geom_2023
+SET geom = ST_Multi(ST_GeomFromText(wkt, 4326));
+
+CREATE INDEX arc_bg_geom_2023_gix ON acs_5yr_2023.arc_bg_geom_2023 USING GIST (geom);
+
+-- UnitsInStructure
+DROP TABLE IF EXISTS acs_5yr_2023.arc_unitsinstructure_2023_bg CASCADE;
+CREATE TABLE acs_5yr_2023.arc_unitsinstructure_2023_bg (
+  geoid text PRIMARY KEY,
+  name text,
+  state text,
+  county text,
+  tract text,
+  block_group text
+  -- variable columns will be auto-added via COPY if header names match; or we can widen first
+);
+
+\copy acs_5yr_2023.arc_unitsinstructure_2023_bg FROM '/nfs/home/sja/repos/census_pecas_download/ARC_UnitsInStructure_2023_BG.csv' WITH (FORMAT csv, HEADER true);
+
+-- Create a spatial view joining geometry
+DROP VIEW IF EXISTS acs_5yr_2023.v_arc_unitsinstructure_2023_bg;
+CREATE VIEW acs_5yr_2023.v_arc_unitsinstructure_2023_bg AS
+SELECT g.geom, d.*
+FROM acs_5yr_2023.arc_bg_geom_2023 g
+JOIN acs_5yr_2023.arc_unitsinstructure_2023_bg d ON d.geoid = g.geoid;
+
+-- Tenure
+DROP TABLE IF EXISTS acs_5yr_2023.arc_tenure_2023_bg CASCADE;
+CREATE TABLE acs_5yr_2023.arc_tenure_2023_bg (
+  geoid text PRIMARY KEY,
+  name text,
+  state text,
+  county text,
+  tract text,
+  block_group text
+  -- variable columns will be auto-added via COPY if header names match; or we can widen first
+);
+
+\copy acs_5yr_2023.arc_tenure_2023_bg FROM '/nfs/home/sja/repos/census_pecas_download/ARC_Tenure_2023_BG.csv' WITH (FORMAT csv, HEADER true);
+
+-- Create a spatial view joining geometry
+DROP VIEW IF EXISTS acs_5yr_2023.v_arc_tenure_2023_bg;
+CREATE VIEW acs_5yr_2023.v_arc_tenure_2023_bg AS
+SELECT g.geom, d.*
+FROM acs_5yr_2023.arc_bg_geom_2023 g
+JOIN acs_5yr_2023.arc_tenure_2023_bg d ON d.geoid = g.geoid;
+
+-- TenureByHHSize
+DROP TABLE IF EXISTS acs_5yr_2023.arc_tenurebyhhsize_2023_bg CASCADE;
+CREATE TABLE acs_5yr_2023.arc_tenurebyhhsize_2023_bg (
+  geoid text PRIMARY KEY,
+  name text,
+  state text,
+  county text,
+  tract text,
+  block_group text
+  -- variable columns will be auto-added via COPY if header names match; or we can widen first
+);
+
+\copy acs_5yr_2023.arc_tenurebyhhsize_2023_bg FROM '/nfs/home/sja/repos/census_pecas_download/ARC_TenureByHHSize_2023_BG.csv' WITH (FORMAT csv, HEADER true);
+
+-- Create a spatial view joining geometry
+DROP VIEW IF EXISTS acs_5yr_2023.v_arc_tenurebyhhsize_2023_bg;
+CREATE VIEW acs_5yr_2023.v_arc_tenurebyhhsize_2023_bg AS
+SELECT g.geom, d.*
+FROM acs_5yr_2023.arc_bg_geom_2023 g
+JOIN acs_5yr_2023.arc_tenurebyhhsize_2023_bg d ON d.geoid = g.geoid;
+
+-- HouseholdSize
+DROP TABLE IF EXISTS acs_5yr_2023.arc_householdsize_2023_bg CASCADE;
+CREATE TABLE acs_5yr_2023.arc_householdsize_2023_bg (
+  geoid text PRIMARY KEY,
+  name text,
+  state text,
+  county text,
+  tract text,
+  block_group text
+  -- variable columns will be auto-added via COPY if header names match; or we can widen first
+);
+
+\copy acs_5yr_2023.arc_householdsize_2023_bg FROM '/nfs/home/sja/repos/census_pecas_download/ARC_HouseholdSize_2023_BG.csv' WITH (FORMAT csv, HEADER true);
+
+-- Create a spatial view joining geometry
+DROP VIEW IF EXISTS acs_5yr_2023.v_arc_householdsize_2023_bg;
+CREATE VIEW acs_5yr_2023.v_arc_householdsize_2023_bg AS
+SELECT g.geom, d.*
+FROM acs_5yr_2023.arc_bg_geom_2023 g
+JOIN acs_5yr_2023.arc_householdsize_2023_bg d ON d.geoid = g.geoid;
+
+-- IncomeDist
+DROP TABLE IF EXISTS acs_5yr_2023.arc_incomedist_2023_bg CASCADE;
+CREATE TABLE acs_5yr_2023.arc_incomedist_2023_bg (
+  geoid text PRIMARY KEY,
+  name text,
+  state text,
+  county text,
+  tract text,
+  block_group text
+  -- variable columns will be auto-added via COPY if header names match; or we can widen first
+);
+
+\copy acs_5yr_2023.arc_incomedist_2023_bg FROM '/nfs/home/sja/repos/census_pecas_download/ARC_IncomeDist_2023_BG.csv' WITH (FORMAT csv, HEADER true);
+
+-- Create a spatial view joining geometry
+DROP VIEW IF EXISTS acs_5yr_2023.v_arc_incomedist_2023_bg;
+CREATE VIEW acs_5yr_2023.v_arc_incomedist_2023_bg AS
+SELECT g.geom, d.*
+FROM acs_5yr_2023.arc_bg_geom_2023 g
+JOIN acs_5yr_2023.arc_incomedist_2023_bg d ON d.geoid = g.geoid;
+
+-- RaceEthnicity
+DROP TABLE IF EXISTS acs_5yr_2023.arc_raceethnicity_2023_bg CASCADE;
+CREATE TABLE acs_5yr_2023.arc_raceethnicity_2023_bg (
+  geoid text PRIMARY KEY,
+  name text,
+  state text,
+  county text,
+  tract text,
+  block_group text
+  -- variable columns will be auto-added via COPY if header names match; or we can widen first
+);
+
+\copy acs_5yr_2023.arc_raceethnicity_2023_bg FROM '/nfs/home/sja/repos/census_pecas_download/ARC_RaceEthnicity_2023_BG.csv' WITH (FORMAT csv, HEADER true);
+
+-- Create a spatial view joining geometry
+DROP VIEW IF EXISTS acs_5yr_2023.v_arc_raceethnicity_2023_bg;
+CREATE VIEW acs_5yr_2023.v_arc_raceethnicity_2023_bg AS
+SELECT g.geom, d.*
+FROM acs_5yr_2023.arc_bg_geom_2023 g
+JOIN acs_5yr_2023.arc_raceethnicity_2023_bg d ON d.geoid = g.geoid;
+
+Done. You can now query the v_arc_* views as GIS layers.

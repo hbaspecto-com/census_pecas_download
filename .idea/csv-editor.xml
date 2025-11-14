@@ -17,6 +17,20 @@
             </Attribute>
           </value>
         </entry>
+        <entry key="/ARC_RaceEthnicity_2023_BG.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/ARC_TenureByHHSize_2023_BG.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
         <entry key="/ARC_Tenure_2023_BG.csv">
           <value>
             <Attribute>

@@ -169,6 +169,7 @@ def fetch_blockgroup_geometries(state="13", arc_counties=None):
                 if not geom or geom.get("type") not in ("Polygon", "MultiPolygon"):
                     continue
 
+                # Use the top-level helper
                 wkt = geojson_to_wkt(geom)
                 if not wkt:
                     continue
@@ -222,24 +223,26 @@ def fetch_blockgroup_geometries(state="13", arc_counties=None):
         print(f"  ✔ Kept {county_total} geometries for county {county}")
         print(f"Running total = {total_kept}\n")
 
-        print(f"Final total block groups downloaded: {total_kept}")
-        # Convert collected records (list of dicts) to a DataFrame so that
-        # downstream code can treat this like other tabular data and call .to_csv()
-        if not records:
-            # Return an empty DataFrame with the expected columns if no records
-            return pd.DataFrame(
-                columns=["GEOID", "STATE", "COUNTY", "TRACT", "BLOCK_GROUP", "wkt"]
-            )
+    # After all counties are processed
+    print(f"Final total block groups downloaded: {total_kept}")
+    # Convert collected records (list of dicts) to a DataFrame so that
+    # downstream code can treat this like other tabular data and call .to_csv()
+    if not records:
+        # Return an empty DataFrame with the expected columns if no records
+        return pd.DataFrame(
+            columns=["GEOID", "STATE", "COUNTY", "TRACT", "BLOCK_GROUP", "wkt"]
+        )
 
-        return pd.DataFrame(records)
+    return pd.DataFrame(records)
 
-    def geojson_to_wkt(geom):
-        """
-        Convert a minimal GeoJSON geometry to WKT (Polygon/MultiPolygon) without external libs.
-        Assumes coordinates are in lon/lat (EPSG:4326).
-        """
-        if not geom:
-            return None
+def geojson_to_wkt(geom):
+    """
+    Convert a minimal GeoJSON geometry to WKT (Polygon/MultiPolygon) without external libs.
+    Assumes coordinates are in lon/lat (EPSG:4326).
+    """
+    if not geom:
+        return None
+
     gtype = geom.get("type")
     coords = geom.get("coordinates")
 
@@ -265,6 +268,7 @@ def fetch_blockgroup_geometries(state="13", arc_counties=None):
                 continue
             rings.append("(" + ", ".join(pts) + ")")
         return "POLYGON(" + ", ".join(rings) + ")" if rings else None
+
     elif gtype == "MultiPolygon":
         polys = []
         for poly in coords or []:
@@ -283,6 +287,7 @@ def fetch_blockgroup_geometries(state="13", arc_counties=None):
             if rings:
                 polys.append("(" + ", ".join(rings) + ")")
         return "MULTIPOLYGON(" + ", ".join(polys) + ")" if polys else None
+
     else:
         return None
 
@@ -376,11 +381,11 @@ if __name__ == "__main__":
         print("Skipping ACS tables (geom-only mode).")
 
     # 2) Geometries
-    geom_df = fetch_blockgroup_geometries()
+    geom_df = fetch_blockgroup_geometries(state = state, arc_counties = arc_counties)
     save_csv(geom_df, "ARC_BG_Geometries_2023.csv")
 
     # 3) Emit PostGIS loading instructions (prints to console)
     db_url = os.environ.get("POSTGRES_URL", "")
-    to_postgis_instructions(db_url or "<postgresql://user:pass@host:port/dbname>", schema="public")
+    #to_postgis_instructions(db_url or "<postgresql://user:pass@host:port/dbname>", schema="public")
 
     print("Done.")

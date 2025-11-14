@@ -361,7 +361,9 @@ JOIN {schema}.{base} d ON d.geoid = g.geoid;
     print("Done. You can now query the v_arc_* views as GIS layers.")
 
 def save_csv(df, path):
-    df.to_csv(path, index=False)
+
+    out_file = os.path.join(download_dir, path)
+    df.to_csv(out_file, index=False)
 
 # Download and save all tables
 
@@ -370,6 +372,9 @@ if __name__ == "__main__":
     os.makedirs(".", exist_ok=True)
 
     geom_only = "--geom-only" in sys.argv
+
+    download_dir = "downloads"
+    os.makedirs(download_dir, exist_ok=True)
 
     if not geom_only:
         # 1) Data tables

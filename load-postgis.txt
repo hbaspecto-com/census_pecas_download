@@ -30,6 +30,7 @@ SET geom = ST_Multi(ST_GeomFromText(wkt, 4326));
 
 CREATE INDEX arc_bg_geom_2023_gix ON acs_5yr_2023.arc_bg_geom_2023 USING GIST (geom);
 
+ALTER TABLE acs_5yr_2023.arc_bg_geom_2023 ADD CONSTRAINT arc_bg_geom_2023_pkey PRIMARY KEY (geoid);
 -- UnitsInStructure
 DROP TABLE IF EXISTS acs_5yr_2023.arc_unitsinstructure_2023_bg CASCADE;
 CREATE TABLE acs_5yr_2023.arc_unitsinstructure_2023_bg (
@@ -110,7 +111,7 @@ CREATE TABLE acs_5yr_2023.arc_householdsize_2023_bg (
 -- Create a spatial view joining geometry
 DROP VIEW IF EXISTS acs_5yr_2023.v_arc_householdsize_2023_bg;
 CREATE VIEW acs_5yr_2023.v_arc_householdsize_2023_bg AS
-SELECT g.geom, d.*
+SELECT d.*, g.geom
 FROM acs_5yr_2023.arc_bg_geom_2023 g
 JOIN acs_5yr_2023.arc_householdsize_2023_bg d ON d.geoid = g.geoid;
 

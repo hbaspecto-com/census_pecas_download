@@ -6,8 +6,8 @@ import sys
 from urllib.parse import quote_plus
 
 arc_counties = [
-    "015","013","045","057","063","067","077","089","085","097",
-    "113","117","121","135","151","153","223","231","247","255","297"
+    "013","015","035","045","057","063","067","077","085","089",
+    "097","113","117","121","135","143","151","159","217","223","247"
 ]
 
 state = "13"
@@ -114,105 +114,138 @@ def fetch_blockgroup_geometries():
             "returnExceededLimitFeatures": "true"
         }
         print(f"Downloading geometry for county {county} ...")
-        try:
-            resp = requests.get(base, params=params, timeout=60)
-        except Exception as ex:
-            print(f"  Request error for county {county}: {ex}")
-            continue
-
-        if resp.status_code != 200:
-            print(f"  Geometry HTTP error {resp.status_code}")
+        # Pagination loop
+        offset = 0
+        page_total = 0
+        while True:
+            params["resultOffset"] = offset
             try:
-                errj = resp.json()
-                if isinstance(errj, dict) and "error" in errj:
-                    e = errj["error"]
-                    print(f"    ArcGIS error code={e.get('code')} message={e.get('message')}")
-                    if e.get("details"):
-                        print(f"  details: {e['details']}")
-                else:
-                    print(f"    body (json): {errj}")
-            except Exception:
-                print(f"    body (text): {resp.text[:300]}")
-            continue
+                resp = requests.get(base, params=params, timeout=60)
+            except Exception as ex:
+                print(f"  Request error for county {county} (offset {offset}): {ex}")
+                break
 
-        try:
-            gj = resp.json()
-        except Exception as ex:
-            print(f"  Geometry parse error: {ex}; body: {resp.text[:300]}")
-            continue
+            if resp.status_code != 200:
+                print(f"  Geometry HTTP error {resp.status_code} (offset {offset})")
+                try:
+                    errj = resp.json()
+                    if isinstance(errj, dict) and "error" in errj:
+                        e = errj["error"]
+                        print(f"    ArcGIS error code={e.get('code')} message={e.get('message')}")
+                        if e.get("details"):
+                            print(f"  details: {e['details']}")
+                    else:
+                        print(f"    body (json): {errj}")
+                except Exception:
+                    print(f"    body (text): {resp.text[:300]}")
+                break
 
-        if isinstance(gj, dict) and "error" in gj:
-            e = gj["error"]
-            print(f"  ArcGIS payload error code={e.get('code')} message={e.get('message')}")
-            if e.get("details"):
-                print(f"  details: {e['details']}")
-            continue
+            try:
+                gj = resp.json()
+            except Exception as ex:
+                print(f"  Geometry parse error (offset {offset}): {ex}; body: {resp.text[:300]}")
+                break
 
-        feats = gj.get("features", [])
-        print(f"  features returned: {len(feats)}")
-        if not feats:
-            continue
+            if isinstance(gj, dict) and "error" in gj:
+                e = gj["error"]
+                print(f"  ArcGIS payload error code={e.get('code')} message={e.get('message')} (offset {offset})")
+                if e.get("details"):
+                    print(f"  details: {e['details']}")
+                break
 
-        sample_props = feats[0].get("properties") or {}
-        if sample_props:
-            print(f"  sample keys: {sorted(list(sample_props.keys()))[:10]}")
+            feats = gj.get("features", [])
+            got = len(feats)
+            print(f"  features returned: {got} (offset {offset})")
+            if not feats:
+                # No more pages
+                break
 
-        for feat in feats:
-            props = feat.get("properties") or {}
-            geom = feat.get("geometry")
-            if not geom or geom.get("type") not in ("Polygon", "MultiPolygon"):
-                continue
+            sample_props = feats[0].get("properties") or {}
+            if sample_props and offset == 0:
+                print(f"  sample keys: {sorted(list(sample_props.keys()))[:10]}")
 
-            wkt = geojson_to_wkt(geom)
-            if not wkt:
-                continue
+            for feat in feats:
+                props = feat.get("properties") or {}
+                geom = feat.get("geometry")
+                if not geom or geom.get("type") not in ("Polygon", "MultiPolygon"):
+                    continue
 
-            geoid = str(
-                props.get("GEOID")
-                or props.get("GEOID10")
-                or props.get("BG_GEOID")
-                or ""
-            ).strip()
+                wkt = geojson_to_wkt(geom)
+                if not wkt:
+                    continue
 
-            # On layer 10 the fields are STATE, COUNTY, TRACT, BLOCK_GROUP
-            st = (props.get("STATE") or "").strip()
-            co = (props.get("COUNTY") or "").strip()
-            tr = (props.get("TRACT") or "").strip()
-            bg = (props.get("BLOCK_GROUP") or "").strip()
-            # If components missing, try to derive from GEOID by keeping only digits
-            if (not st or not co or not tr or not bg) and geoid:
-                geoid_digits = "".join(ch for ch in geoid if ch.isdigit())
-                if len(geoid_digits) >= 12:
-                    st = st or geoid_digits[0:2]
-                    co = co or geoid_digits[2:5]
-                    tr = tr or geoid_digits[5:11]
-                    bg = bg or geoid_digits[11:12]
+                geoid = str(
+                    props.get("GEOID")
+                    or props.get("GEOID10")
+                    or props.get("BG_GEOID")
+                    or ""
+                ).strip()
 
-            if not (st and co and tr and bg):
-                continue
+                # On layer 10 the fields are STATE, COUNTY, TRACT, BLOCK_GROUP
+                st = (props.get("STATE") or "").strip()
+                co = (props.get("COUNTY") or "").strip()
+                tr = (props.get("TRACT") or "").strip()
+                bg = (props.get("BLOCK_GROUP") or "").strip()
 
-            # Zero-pad safety
-            if st.isdigit() and len(st) < 2:
-                st = st.zfill(2)
-            if co.isdigit() and len(co) < 3:
-                co = co.zfill(3)
-            if tr.isdigit() and len(tr) < 6:
-                tr = tr.zfill(6)
+                # Normalize components safely
+                def digits(s: str) -> str:
+                    return "".join(ch for ch in s if ch.isdigit())
 
-            if not geoid:
-                geoid = f"{st}{co}{tr}{bg}"
+                # State and county should be 2 and 3 digits
+                st_d = digits(st)
+                co_d = digits(co)
+                if st_d:
+                    st = st_d.zfill(2)
+                if co_d:
+                    co = co_d.zfill(3)
 
-            records.append({
-                "GEOID": geoid,
-                "STATE": st,
-                "COUNTY": co,
-                "TRACT": tr,
-                "BLOCK_GROUP": bg,
-                "wkt": wkt
-            })
-            total_kept += 1
+                # Tract must be 6-digit numeric string
+                tr_d = digits(tr)
+                if tr_d:
+                    tr = tr_d.zfill(6)
 
-        print(f"Total geometries kept: {total_kept}")
+                # Block group must be 1 digit
+                bg_d = digits(bg)
+                if bg_d:
+                    bg = bg_d[:1]
+
+                # If components missing, derive from GEOID digits
+                if (not st or not co or not tr or not bg) and geoid:
+                    g = digits(geoid)
+                    if len(g) >= 12:
+                        st = st or g[0:2]
+                        co = co or g[2:5]
+                        tr = tr or g[5:11]
+                        bg = bg or g[11:12]
+
+                # Final validation: exact lengths required
+                if not (st and co and tr and bg):
+                    continue
+                if not (len(st) == 2 and len(co) == 3 and len(tr) == 6 and len(bg) == 1):
+                    continue
+
+                if not geoid:
+                    geoid = f"{st}{co}{tr}{bg}"
+
+                records.append({
+                    "GEOID": geoid,
+                    "STATE": st,
+                    "COUNTY": co,
+                    "TRACT": tr,
+                    "BLOCK_GROUP": bg,
+                    "wkt": wkt
+                })
+                total_kept += 1
+                page_total += 1
+
+            # Next page
+            if got < params["resultRecordCount"]:
+                # Last page reached
+                break
+            offset += got
+
+        print(f"  Total geometries kept for county {county}: {page_total}")
+        print(f"Running total geometries kept: {total_kept}")
 
     gdf = pd.DataFrame.from_records(records)
     if gdf.empty:

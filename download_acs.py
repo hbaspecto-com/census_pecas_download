@@ -151,7 +151,7 @@ def fetch_blockgroup_geometries(state="13", arc_counties=None):
     # ✅ Layer 5 = Block Groups (correct)
     base = (
         "https://tigerweb.geo.census.gov/arcgis/rest/services/"
-        "Census2020/Tracts_Blocks/MapServer/5/query"
+        "TIGERweb/tigerWMS_ACS2023/MapServer/10/query"
     )
 
     records = []
@@ -209,11 +209,13 @@ def fetch_blockgroup_geometries(state="13", arc_counties=None):
 
                 # Must be polygonal geometry
                 if not geom or geom.get("type") not in ("Polygon", "MultiPolygon"):
+                    print(f"  Skipping unsupported geometry type: {geom.get('type') if geom else 'None'}")
                     continue
 
                 # Use the top-level helper
                 wkt = geojson_to_wkt(geom)
                 if not wkt:
+                    print(f"  Skipping unsupported geometry: {geom}")
                     continue
 
                 # Direct fields from Layer 5
@@ -238,8 +240,10 @@ def fetch_blockgroup_geometries(state="13", arc_counties=None):
 
                 # Validate
                 if not (st and co and tr and bg):
+                    print(f"  Skipping invalid GEOID: {geoid} since {st} {co} {tr} {bg} are missing")
                     continue
                 if not (len(st) == 2 and len(co) == 3 and len(tr) == 6 and len(bg) == 1):
+                    print(f"  Skipping invalid GEOID: {geoid} since {st}, {co}, {tr}, {bg} are wrong length")
                     continue
 
                 if not geoid:

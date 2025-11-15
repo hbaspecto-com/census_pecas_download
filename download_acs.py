@@ -34,11 +34,42 @@ def make_geoid(df):
     # All are strings from API; zero-padding preserved already
     return (df["state"] + df["county"] + df["tract"] + df["block group"])
 
-def fetch_table(table):
+def fetch_table(table, geoid_list=None):
+    """
+    Fetch ACS table data for block groups.
+    
+    Args:
+        table: ACS table name (e.g., "B25024")
+        geoid_list: Optional list of GEOIDs to fetch data for. If provided, only these
+                    block groups will be fetched. If None, fetches all block groups in arc_counties.
+    
+    Returns:
+        DataFrame with GEOID and ACS variables
+    """
     vars_all = get_variables(table)
     rows = []
+    
+    # If geoid_list provided, organize by county for efficient querying
+    if geoid_list is not None:
+        # Group GEOIDs by county
+        county_bgs = {}
+        for geoid in geoid_list:
+            if len(geoid) >= 5:
+                county_code = geoid[2:5]
+                if county_code not in county_bgs:
+                    county_bgs[county_code] = []
+                # Extract tract and block group
+                if len(geoid) >= 12:
+                    tract = geoid[5:11]
+                    bg = geoid[11:12]
+                    county_bgs[county_code].append((tract, bg))
+        
+        counties_to_fetch = list(county_bgs.keys())
+    else:
+        counties_to_fetch = arc_counties
+        county_bgs = None
 
-    for county in arc_counties:
+    for county in counties_to_fetch:
         print(f"  County {county}...")
 
         # Collect chunks and merge them later
@@ -73,16 +104,27 @@ def fetch_table(table):
                     time.sleep(2)
 
         # Merge all chunks horizontally
-        df_merged = df_chunks[0]
-        for part in df_chunks[1:]:
-            df_merged = df_merged.merge(
-                part.drop(columns=["NAME"]),
-                on=["state","county","tract","block group"],
-                how="left"
-            )
+        if df_chunks:
+            df_merged = df_chunks[0]
+            for part in df_chunks[1:]:
+                df_merged = df_merged.merge(
+                    part.drop(columns=["NAME"]),
+                    on=["state","county","tract","block group"],
+                    how="left"
+                )
 
-        rows.append(df_merged)
+            # If geoid_list provided, filter to only those block groups
+            if county_bgs is not None and county in county_bgs:
+                df_merged["temp_geoid"] = make_geoid(df_merged)
+                target_geoids = [f"{state}{county}{tract}{bg}" for tract, bg in county_bgs[county]]
+                df_merged = df_merged[df_merged["temp_geoid"].isin(target_geoids)]
+                df_merged = df_merged.drop(columns=["temp_geoid"])
 
+            rows.append(df_merged)
+
+    if not rows:
+        return pd.DataFrame()
+    
     out = pd.concat(rows, ignore_index=True)
     out["GEOID"] = make_geoid(out)
     # Optional: reorder GEOID first
@@ -109,7 +151,7 @@ def fetch_blockgroup_geometries(state="13", arc_counties=None):
     # ✅ Layer 5 = Block Groups (correct)
     base = (
         "https://tigerweb.geo.census.gov/arcgis/rest/services/"
-        "Census2020/Tracts_Blocks/MapServer/5/query"
+        "TIGERweb/tigerWMS_ACS2023/MapServer/10/query"
     )
 
     records = []
@@ -167,11 +209,13 @@ def fetch_blockgroup_geometries(state="13", arc_counties=None):
 
                 # Must be polygonal geometry
                 if not geom or geom.get("type") not in ("Polygon", "MultiPolygon"):
+                    print(f"  Skipping unsupported geometry type: {geom.get('type') if geom else 'None'}")
                     continue
 
                 # Use the top-level helper
                 wkt = geojson_to_wkt(geom)
                 if not wkt:
+                    print(f"  Skipping unsupported geometry: {geom}")
                     continue
 
                 # Direct fields from Layer 5
@@ -196,8 +240,10 @@ def fetch_blockgroup_geometries(state="13", arc_counties=None):
 
                 # Validate
                 if not (st and co and tr and bg):
+                    print(f"  Skipping invalid GEOID: {geoid} since {st} {co} {tr} {bg} are missing")
                     continue
                 if not (len(st) == 2 and len(co) == 3 and len(tr) == 6 and len(bg) == 1):
+                    print(f"  Skipping invalid GEOID: {geoid} since {st}, {co}, {tr}, {bg} are wrong length")
                     continue
 
                 if not geoid:
@@ -365,6 +411,47 @@ def save_csv(df, path):
     out_file = os.path.join(download_dir, path)
     df.to_csv(out_file, index=False)
 
+def compare_geoids(geom_geoids, data_geoids, table_label):
+    """
+    Compare GEOIDs between geometry and data tables and report mismatches.
+    
+    Args:
+        geom_geoids: Set or list of GEOIDs from geometry data
+        data_geoids: Set or list of GEOIDs from table data
+        table_label: Label for the table being compared (for reporting)
+    
+    Returns:
+        dict with 'in_geom_not_data' and 'in_data_not_geom' lists
+    """
+    geom_set = set(geom_geoids)
+    data_set = set(data_geoids)
+    
+    in_geom_not_data = sorted(geom_set - data_set)
+    in_data_not_geom = sorted(data_set - geom_set)
+    
+    print(f"\n  GEOID Comparison for {table_label}:")
+    print(f"    Block groups in geometry: {len(geom_set)}")
+    print(f"    Block groups in data: {len(data_set)}")
+    print(f"    In geometry but NOT in data: {len(in_geom_not_data)}")
+    if in_geom_not_data:
+        print(f"      (Possible data suppression or missing data)")
+        if len(in_geom_not_data) <= 10:
+            print(f"      GEOIDs: {in_geom_not_data}")
+        else:
+            print(f"      First 10 GEOIDs: {in_geom_not_data[:10]}")
+    print(f"    In data but NOT in geometry: {len(in_data_not_geom)}")
+    if in_data_not_geom:
+        print(f"      (Unexpected - should investigate)")
+        if len(in_data_not_geom) <= 10:
+            print(f"      GEOIDs: {in_data_not_geom}")
+        else:
+            print(f"      First 10 GEOIDs: {in_data_not_geom[:10]}")
+    
+    return {
+        'in_geom_not_data': in_geom_not_data,
+        'in_data_not_geom': in_data_not_geom
+    }
+
 # Download and save all tables
 
 
@@ -376,18 +463,64 @@ if __name__ == "__main__":
     download_dir = "downloads"
     os.makedirs(download_dir, exist_ok=True)
 
-    if not geom_only:
-        # 1) Data tables
-        for table, label in tables.items():
-            print(f"Downloading {table} ({label}) ...")
-            df = fetch_table(table)
-            save_csv(df, f"ARC_{label}_2023_BG.csv")
-    else:
-        print("Skipping ACS tables (geom-only mode).")
-
-    # 2) Geometries
+    # 1) First, download geometries to get the definitive list of block groups
+    print("Downloading block group geometries...")
     geom_df = fetch_blockgroup_geometries(state = state, arc_counties = arc_counties)
     save_csv(geom_df, "ARC_BG_Geometries_2023.csv")
+    
+    # Extract the list of GEOIDs from geometries
+    geoid_list = geom_df["GEOID"].tolist() if not geom_df.empty else []
+    print(f"Found {len(geoid_list)} block groups from geometry download.")
+
+    if not geom_only:
+        # 2) Data tables - fetch only for the GEOIDs we have geometries for
+        all_mismatches = {}
+        
+        for table, label in tables.items():
+            print(f"Downloading {table} ({label}) for {len(geoid_list)} block groups...")
+            df = fetch_table(table, geoid_list=geoid_list)
+            save_csv(df, f"ARC_{label}_2023_BG.csv")
+            print(f"  Downloaded {len(df)} rows for {label}")
+            
+            # Compare GEOIDs between geometry and table data
+            if not df.empty and "GEOID" in df.columns:
+                data_geoids = df["GEOID"].tolist()
+                mismatches = compare_geoids(geoid_list, data_geoids, label)
+                all_mismatches[label] = mismatches
+        
+        # Save mismatch report to a file
+        if all_mismatches:
+            print("\nSaving GEOID mismatch report...")
+            mismatch_report_path = os.path.join(download_dir, "GEOID_Mismatch_Report.txt")
+            with open(mismatch_report_path, 'w') as f:
+                f.write("GEOID Mismatch Report\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Total block groups in geometry: {len(geoid_list)}\n\n")
+                
+                for label, mismatches in all_mismatches.items():
+                    f.write(f"\n{label} ({tables.get([k for k, v in tables.items() if v == label][0], 'Unknown')})\n")
+                    f.write("-" * 80 + "\n")
+                    f.write(f"In geometry but NOT in data ({len(mismatches['in_geom_not_data'])} block groups):\n")
+                    if mismatches['in_geom_not_data']:
+                        f.write("  Note: This may be due to data suppression or missing data\n")
+                        for geoid in mismatches['in_geom_not_data']:
+                            f.write(f"  {geoid}\n")
+                    else:
+                        f.write("  None\n")
+                    
+                    f.write(f"\nIn data but NOT in geometry ({len(mismatches['in_data_not_geom'])} block groups):\n")
+                    if mismatches['in_data_not_geom']:
+                        f.write("  Note: This is unexpected and should be investigated\n")
+                        for geoid in mismatches['in_data_not_geom']:
+                            f.write(f"  {geoid}\n")
+                    else:
+                        f.write("  None\n")
+                    f.write("\n")
+            
+            print(f"Mismatch report saved to: {mismatch_report_path}")
+    else:
+        print("Skipping ACS tables (geom-only mode).")
 
     # 3) Emit PostGIS loading instructions (prints to console)
     db_url = os.environ.get("POSTGRES_URL", "")

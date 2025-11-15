@@ -407,6 +407,47 @@ def save_csv(df, path):
     out_file = os.path.join(download_dir, path)
     df.to_csv(out_file, index=False)
 
+def compare_geoids(geom_geoids, data_geoids, table_label):
+    """
+    Compare GEOIDs between geometry and data tables and report mismatches.
+    
+    Args:
+        geom_geoids: Set or list of GEOIDs from geometry data
+        data_geoids: Set or list of GEOIDs from table data
+        table_label: Label for the table being compared (for reporting)
+    
+    Returns:
+        dict with 'in_geom_not_data' and 'in_data_not_geom' lists
+    """
+    geom_set = set(geom_geoids)
+    data_set = set(data_geoids)
+    
+    in_geom_not_data = sorted(geom_set - data_set)
+    in_data_not_geom = sorted(data_set - geom_set)
+    
+    print(f"\n  GEOID Comparison for {table_label}:")
+    print(f"    Block groups in geometry: {len(geom_set)}")
+    print(f"    Block groups in data: {len(data_set)}")
+    print(f"    In geometry but NOT in data: {len(in_geom_not_data)}")
+    if in_geom_not_data:
+        print(f"      (Possible data suppression or missing data)")
+        if len(in_geom_not_data) <= 10:
+            print(f"      GEOIDs: {in_geom_not_data}")
+        else:
+            print(f"      First 10 GEOIDs: {in_geom_not_data[:10]}")
+    print(f"    In data but NOT in geometry: {len(in_data_not_geom)}")
+    if in_data_not_geom:
+        print(f"      (Unexpected - should investigate)")
+        if len(in_data_not_geom) <= 10:
+            print(f"      GEOIDs: {in_data_not_geom}")
+        else:
+            print(f"      First 10 GEOIDs: {in_data_not_geom[:10]}")
+    
+    return {
+        'in_geom_not_data': in_geom_not_data,
+        'in_data_not_geom': in_data_not_geom
+    }
+
 # Download and save all tables
 
 
@@ -429,11 +470,51 @@ if __name__ == "__main__":
 
     if not geom_only:
         # 2) Data tables - fetch only for the GEOIDs we have geometries for
+        all_mismatches = {}
+        
         for table, label in tables.items():
             print(f"Downloading {table} ({label}) for {len(geoid_list)} block groups...")
             df = fetch_table(table, geoid_list=geoid_list)
             save_csv(df, f"ARC_{label}_2023_BG.csv")
             print(f"  Downloaded {len(df)} rows for {label}")
+            
+            # Compare GEOIDs between geometry and table data
+            if not df.empty and "GEOID" in df.columns:
+                data_geoids = df["GEOID"].tolist()
+                mismatches = compare_geoids(geoid_list, data_geoids, label)
+                all_mismatches[label] = mismatches
+        
+        # Save mismatch report to a file
+        if all_mismatches:
+            print("\nSaving GEOID mismatch report...")
+            mismatch_report_path = os.path.join(download_dir, "GEOID_Mismatch_Report.txt")
+            with open(mismatch_report_path, 'w') as f:
+                f.write("GEOID Mismatch Report\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Total block groups in geometry: {len(geoid_list)}\n\n")
+                
+                for label, mismatches in all_mismatches.items():
+                    f.write(f"\n{label} ({tables.get([k for k, v in tables.items() if v == label][0], 'Unknown')})\n")
+                    f.write("-" * 80 + "\n")
+                    f.write(f"In geometry but NOT in data ({len(mismatches['in_geom_not_data'])} block groups):\n")
+                    if mismatches['in_geom_not_data']:
+                        f.write("  Note: This may be due to data suppression or missing data\n")
+                        for geoid in mismatches['in_geom_not_data']:
+                            f.write(f"  {geoid}\n")
+                    else:
+                        f.write("  None\n")
+                    
+                    f.write(f"\nIn data but NOT in geometry ({len(mismatches['in_data_not_geom'])} block groups):\n")
+                    if mismatches['in_data_not_geom']:
+                        f.write("  Note: This is unexpected and should be investigated\n")
+                        for geoid in mismatches['in_data_not_geom']:
+                            f.write(f"  {geoid}\n")
+                    else:
+                        f.write("  None\n")
+                    f.write("\n")
+            
+            print(f"Mismatch report saved to: {mismatch_report_path}")
     else:
         print("Skipping ACS tables (geom-only mode).")
 

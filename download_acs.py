@@ -34,6 +34,10 @@ def make_geoid(df):
     # All are strings from API; zero-padding preserved already
     return (df["state"] + df["county"] + df["tract"] + df["block group"])
 
+def make_tract_geoid(df):
+    # 11-digit tract GEOID: SSCCCTTTTTT
+    return (df["state"] + df["county"] + df["tract"])
+
 def fetch_table(table, geoid_list=None):
     """
     Fetch ACS table data for block groups.
@@ -129,6 +133,68 @@ def fetch_table(table, geoid_list=None):
     out["GEOID"] = make_geoid(out)
     # Optional: reorder GEOID first
     cols = ["GEOID","NAME","state","county","tract","block group"] + [c for c in out.columns if c not in {"GEOID","NAME","state","county","tract","block group"}]
+    return out[cols]
+
+def fetch_tract_table(table, arc_counties_list=None, state_code=None):
+    """
+    Fetch ACS table data for census tracts within ARC counties.
+
+    Args:
+        table: ACS table/group name (e.g., "B11001")
+        arc_counties_list: list of 3-digit county FIPS in the target state
+        state_code: 2-digit state FIPS string
+
+    Returns:
+        DataFrame with GEOID (tract), geography keys, and variables
+    """
+    if arc_counties_list is None:
+        arc_counties_list = arc_counties
+    if state_code is None:
+        state_code = state
+
+    vars_all = get_variables(table)
+    rows = []
+
+    for county in arc_counties_list:
+        print(f"  County {county} (tracts)...")
+        df_chunks = []
+        for var_chunk in chunk(vars_all, 20):
+            vars_str = ",".join(var_chunk)
+            url = (
+                f"https://api.census.gov/data/2023/acs/acs5?"
+                f"get=NAME,{vars_str}&"
+                f"for=tract:*&"
+                f"in=state:{state_code}%20county:{county}"
+            )
+            for attempt in range(5):
+                try:
+                    resp = requests.get(url, timeout=30)
+                    if resp.status_code != 200:
+                        print(f"    API error {resp.status_code}: {resp.text[:200]}")
+                        time.sleep(2)
+                        continue
+                    data = resp.json()
+                    df = pd.DataFrame(data[1:], columns=data[0])
+                    df_chunks.append(df)
+                    break
+                except Exception as e:
+                    print(f"    Error on attempt {attempt+1}: {e}")
+                    time.sleep(2)
+        if df_chunks:
+            df_merged = df_chunks[0]
+            for part in df_chunks[1:]:
+                df_merged = df_merged.merge(
+                    part.drop(columns=["NAME"]),
+                    on=["state","county","tract"],
+                    how="left"
+                )
+            rows.append(df_merged)
+
+    if not rows:
+        return pd.DataFrame()
+    out = pd.concat(rows, ignore_index=True)
+    out["GEOID"] = make_tract_geoid(out)
+    cols = ["GEOID","NAME","state","county","tract"] + [c for c in out.columns if c not in {"GEOID","NAME","state","county","tract"}]
     return out[cols]
 
 import requests
@@ -459,20 +525,43 @@ if __name__ == "__main__":
     os.makedirs(".", exist_ok=True)
 
     geom_only = "--geom-only" in sys.argv
+    tract_households = "--tract-households" in sys.argv
 
     download_dir = "downloads"
     os.makedirs(download_dir, exist_ok=True)
 
-    # 1) First, download geometries to get the definitive list of block groups
-    print("Downloading block group geometries...")
-    geom_df = fetch_blockgroup_geometries(state = state, arc_counties = arc_counties)
-    save_csv(geom_df, "ARC_BG_Geometries_2023.csv")
-    
-    # Extract the list of GEOIDs from geometries
-    geoid_list = geom_df["GEOID"].tolist() if not geom_df.empty else []
-    print(f"Found {len(geoid_list)} block groups from geometry download.")
+    # Optional: If only tract households are requested, we can skip geometry download
+    if not tract_households:
+        # 1) First, download geometries to get the definitive list of block groups
+        print("Downloading block group geometries...")
+        geom_df = fetch_blockgroup_geometries(state = state, arc_counties = arc_counties)
+        save_csv(geom_df, "ARC_BG_Geometries_2023.csv")
+        
+        # Extract the list of GEOIDs from geometries
+        geoid_list = geom_df["GEOID"].tolist() if not geom_df.empty else []
+        print(f"Found {len(geoid_list)} block groups from geometry download.")
+    else:
+        geoid_list = []
 
-    if not geom_only:
+    if tract_households:
+        # Tract-level total households from B11001
+        print("Downloading tract-level total households (B11001) for ARC counties...")
+        tract_df = fetch_tract_table("B11001", arc_counties_list=arc_counties, state_code=state)
+        if not tract_df.empty:
+            # Keep total households estimate and MOE if present
+            keep_cols = [c for c in tract_df.columns if c in {"GEOID","NAME","state","county","tract","B11001_001E","B11001_001M"}]
+            # Ensure at least estimate column exists
+            if "B11001_001E" not in tract_df.columns:
+                print("Warning: B11001_001E not found in response. Saving all variables instead.")
+                out_df = tract_df
+            else:
+                out_df = tract_df[keep_cols]
+            save_csv(out_df, "ARC_TotalHouseholds_2023_Tract.csv")
+            print(f"  Saved tract households to {os.path.join(download_dir, 'ARC_TotalHouseholds_2023_Tract.csv')}")
+            print(f"  Rows: {len(out_df)}")
+        else:
+            print("No tract data returned.")
+    elif not geom_only:
         # 2) Data tables - fetch only for the GEOIDs we have geometries for
         all_mismatches = {}
         

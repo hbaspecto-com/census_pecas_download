@@ -1,4 +1,5 @@
 import requests
+import json
 import pandas as pd
 import time
 import os
@@ -526,12 +527,14 @@ if __name__ == "__main__":
 
     geom_only = "--geom-only" in sys.argv
     tract_households = "--tract-households" in sys.argv
+    tract_households_with_taz = "--tract-households-with-taz" in sys.argv
+    tract_households_base = "--tract-households-base" in sys.argv
 
     download_dir = "downloads"
     os.makedirs(download_dir, exist_ok=True)
 
     # Optional: If only tract households are requested, we can skip geometry download
-    if not tract_households:
+    if not tract_households and not tract_households_with_taz and not tract_households_base:
         # 1) First, download geometries to get the definitive list of block groups
         print("Downloading block group geometries...")
         geom_df = fetch_blockgroup_geometries(state = state, arc_counties = arc_counties)
@@ -543,24 +546,427 @@ if __name__ == "__main__":
     else:
         geoid_list = []
 
-    if tract_households:
+    def _save_tract_households(df, add_taz=False):
+        """
+        Internal helper to save tract households CSV, optionally with TAZ list merged in.
+        When add_taz=True, fetch TAZ list per tract and add a column `TAZ_list` (comma-separated TAZ GEOIDs).
+        """
+        if df.empty:
+            print("No tract data returned.")
+            return
+        # Keep total households estimate and MOE if present
+        keep_cols = [c for c in df.columns if c in {"GEOID","NAME","state","county","tract","B11001_001E","B11001_001M"}]
+        if "B11001_001E" not in df.columns:
+            print("Warning: B11001_001E not found in response. Saving all variables instead.")
+            out_df = df
+        else:
+            out_df = df[keep_cols]
+
+        if add_taz:
+            print("Fetching TAZ membership for tracts using TIGERweb (TAZ centroid-in-tract)...")
+
+            def fetch_taz_by_tract(arc_counties_list=None, state_code=None):
+                """
+                Build TAZ -> tract membership using TIGERweb services via centroid-in-tract rule.
+
+                Steps per county:
+                  1) Query TAZ layer (Census 2020 Traffic Analysis Zones) filtering by state+county,
+                     requesting centroids for each TAZ.
+                  2) For each centroid point, query the Tracts layer (ACS 2023 geography) to find
+                     the containing tract and record mapping TRACT_GEOID -> TAZ_GEOID.
+
+                Returns DataFrame with columns: TRACT_GEOID, TAZ_GEOID
+                """
+                if arc_counties_list is None:
+                    arc_counties_list = arc_counties
+                if state_code is None:
+                    state_code = state
+
+                # TIGERweb endpoints
+                # Resolve the correct TAZ service endpoint dynamically (service name differs by vintage)
+                TAZ_CANDIDATE_URLS = [
+                    # Common current service
+                    "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Traffic_Analysis_Zones/MapServer/0/query",
+                    # Vintage-specific variants
+                    "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Traffic_Analysis_Zones_2020/MapServer/0/query",
+                    # Older guess (may 404)
+                    "https://tigerweb.geo.census.gov/arcgis/rest/services/Census2020/Traffic_Analysis_Zones/MapServer/0/query",
+                ]
+                # We will resolve the correct tracts layer id dynamically (9 is typical, but varies)
+                TRACTS_BASE = (
+                    "https://tigerweb.geo.census.gov/arcgis/rest/services/"
+                    "TIGERweb/tigerWMS_ACS2023/MapServer"
+                )
+                TRACTS_CANDIDATE_LAYERS = [9, 8, 7, 6, 5]
+
+                def _request_with_retry(url, params, max_attempts=5, pause=2):
+                    for attempt in range(max_attempts):
+                        try:
+                            r = requests.get(url, params=params, timeout=40)
+                            if r.status_code == 200:
+                                return r.json()
+                            else:
+                                print(f"    HTTP {r.status_code}: {r.text[:200]}")
+                        except Exception as e:
+                            print(f"    Request error (attempt {attempt+1}): {e}")
+                        time.sleep(pause)
+                    return None
+
+                results = []
+
+                def field_first(attrs, names, default=None):
+                    for n in names:
+                        if n in attrs and attrs[n] is not None:
+                            return attrs[n]
+                    return default
+
+                # Pick a working TAZ query URL by probing candidates
+                def resolve_taz_query_url():
+                    test_params = {"where": "1=1", "outFields": "*", "f": "json", "returnGeometry": "false", "resultRecordCount": 1}
+                    for url in TAZ_CANDIDATE_URLS:
+                        jd = _request_with_retry(url, test_params)
+                        if jd and (jd.get("features") is not None or jd.get("error") is None):
+                            # ArcGIS responds with a JSON that includes features or at least no 404 HTML
+                            if jd.get("features"):
+                                return url
+                    return None
+
+                TAZ_QUERY = resolve_taz_query_url()
+                if not TAZ_QUERY:
+                    print("    Error: Could not resolve a working TAZ service on TIGERweb; TAZ listing will be empty.")
+                    return pd.DataFrame(columns=["TRACT_GEOID","TAZ_GEOID"])
+
+                # Detect a working tracts layer and usable field names
+                def resolve_tracts_layer():
+                    for lid in TRACTS_CANDIDATE_LAYERS:
+                        url = f"{TRACTS_BASE}/{lid}/query"
+                        # Try STATEFP first
+                        for where in (f"STATEFP = '{state_code}'", f"STATE = '{state_code}'", "1=1"):
+                            params = {
+                                "where": where,
+                                "outFields": "*",
+                                "f": "json",
+                                "returnGeometry": "false",
+                                "resultRecordCount": 1
+                            }
+                            jd = _request_with_retry(url, params)
+                            if jd and jd.get("features"):
+                                attrs = jd["features"][0]["attributes"]
+                                # Determine likely field names
+                                state_field = "STATEFP" if "STATEFP" in attrs else ("STATE" if "STATE" in attrs else None)
+                                county_field = "COUNTYFP" if "COUNTYFP" in attrs else ("COUNTY" if "COUNTY" in attrs else None)
+                                tract_field = "TRACTCE" if "TRACTCE" in attrs else ("TRACT" if "TRACT" in attrs else None)
+                                geoid_field = "GEOID" if "GEOID" in attrs else ("GEOID20" if "GEOID20" in attrs else None)
+                                return {
+                                    "layer_id": lid,
+                                    "url": url,
+                                    "state_field": state_field,
+                                    "county_field": county_field,
+                                    "tract_field": tract_field,
+                                    "geoid_field": geoid_field
+                                }
+                    return None
+
+                tracts_meta = resolve_tracts_layer()
+                if not tracts_meta:
+                    print("    Error: Could not resolve a working Tracts layer on TIGERweb; TAZ listing will be empty.")
+                    return pd.DataFrame(columns=["TRACT_GEOID","TAZ_GEOID"])
+                TRACTS_QUERY = tracts_meta["url"]
+
+                for ccc in arc_counties_list:
+                    print(f"  County {ccc} (TAZ centroids and tract lookup)...")
+
+                    # 1) Pull all TAZ features for GA, then client-filter by county (robust to field name changes)
+                    # Try a sequence of server-side filters; fall back to broader pulls if needed.
+                    taz_features = []
+
+                    def pull_taz_features(where_clause=None):
+                        params = {
+                            "outFields": "*",
+                            "f": "json",
+                            "returnGeometry": "true",
+                            "outSR": 4326,
+                            "returnCentroid": "true",
+                            "resultOffset": 0,
+                            "resultRecordCount": 1000
+                        }
+                        if where_clause:
+                            params["where"] = where_clause
+                        else:
+                            params["where"] = "1=1"
+
+                        feats_all = []
+                        while True:
+                            data = _request_with_retry(TAZ_QUERY, params)
+                            if not data or "features" not in data:
+                                break
+                            feats = data.get("features", [])
+                            feats_all.extend(feats)
+                            got = len(feats)
+                            if data.get("exceededTransferLimit") and got > 0:
+                                params["resultOffset"] += got
+                            else:
+                                break
+                        return feats_all
+
+                    # Attempt 1: filter by STATEFP/COUNTYFP (quoted)
+                    taz_features = pull_taz_features(f"STATEFP = '{state_code}' AND COUNTYFP = '{ccc}'")
+                    # Attempt 2: unquoted numeric compare (in case fields are numeric)
+                    if not taz_features:
+                        taz_features = pull_taz_features(f"STATEFP = {int(state_code)} AND COUNTYFP = {int(ccc)}")
+                    # Attempt 3: filter by STATE/COUNTY if previous return 0
+                    if not taz_features:
+                        taz_features = pull_taz_features(f"STATE = '{state_code}' AND COUNTY = '{ccc}'")
+                    # Attempt 3: GA-wide, client-filter county
+                    if not taz_features:
+                        ga_feats = (
+                            pull_taz_features(f"STATEFP = '{state_code}'") or
+                            pull_taz_features(f"STATEFP = {int(state_code)}") or
+                            pull_taz_features(f"STATE = '{state_code}'") or
+                            pull_taz_features(None)
+                        )
+                        # Client-side filter by county code
+                        filtered = []
+                        for ft in ga_feats or []:
+                            a = ft.get("attributes", {}) or {}
+                            county_fields = [
+                                "COUNTYFP", "COUNTY", "CNTYFP", "COUNTYFP20", "COUNTYFIPS"
+                            ]
+                            ok = False
+                            for fld in county_fields:
+                                val = a.get(fld)
+                                if val is not None and str(val).zfill(3) == str(ccc).zfill(3):
+                                    ok = True
+                                    break
+                            if not ok:
+                                # As another fallback, check GEOID suffix
+                                geoid_val = a.get("GEOID") or a.get("GEOID20")
+                                if geoid_val and len(str(geoid_val)) >= 5 and str(geoid_val)[2:5] == str(ccc):
+                                    ok = True
+                            if ok:
+                                filtered.append(ft)
+                        taz_features = filtered
+
+                    if not taz_features:
+                        print("    No TAZ centroid list available; falling back to tract->TAZ polygon intersects...")
+                        # Fallback approach: pull tract polygons for this county, then query TAZ that intersect each tract
+                        # 2a) Pull tract polygons
+                        sf = tracts_meta.get("state_field") or "STATEFP"
+                        cf = tracts_meta.get("county_field") or "COUNTYFP"
+                        tract_where = f"{sf} = '{state_code}' AND {cf} = '{ccc}'"
+                        tract_params2 = {
+                            "where": tract_where,
+                            "outFields": "*",
+                            "f": "json",
+                            "returnGeometry": "true",
+                            "outSR": 4326,
+                            "resultOffset": 0,
+                            "resultRecordCount": 1000
+                        }
+                        tract_polys = []
+                        while True:
+                            td = _request_with_retry(TRACTS_QUERY, tract_params2)
+                            if not td or "features" not in td:
+                                break
+                            feats = td.get("features", [])
+                            tract_polys.extend(feats)
+                            got = len(feats)
+                            if td.get("exceededTransferLimit") and got > 0:
+                                tract_params2["resultOffset"] += got
+                            else:
+                                break
+
+                        if not tract_polys:
+                            # Try alternative WHERE using STATE/COUNTY
+                            tract_params2["where"] = f"STATE = '{state_code}' AND COUNTY = '{ccc}'"
+                            while True:
+                                td = _request_with_retry(TRACTS_QUERY, tract_params2)
+                                if not td or "features" not in td:
+                                    break
+                                feats = td.get("features", [])
+                                tract_polys.extend(feats)
+                                got = len(feats)
+                                if td.get("exceededTransferLimit") and got > 0:
+                                    tract_params2["resultOffset"] += got
+                                else:
+                                    break
+
+                        if not tract_polys:
+                            print("    Warning: Could not retrieve tract polygons for fallback; continuing to next county.")
+                            # As a debugging aid, try printing a sample of available fields
+                            sample = _request_with_retry(TRACTS_QUERY, {"where": "1=1", "outFields": "*", "f": "json", "returnGeometry": "false", "resultRecordCount": 1})
+                            if sample and sample.get("features"):
+                                print("    Tracts sample fields:", list(sample["features"][0]["attributes"].keys()))
+                            continue
+
+                        # 2b) For each tract polygon, get intersecting TAZ features
+                        for tft in tract_polys:
+                            t_attrs2 = tft.get("attributes", {})
+                            tract_geoid2 = field_first(t_attrs2, [tracts_meta.get("geoid_field") or "GEOID", "GEOID20"]) or ""
+                            if not tract_geoid2:
+                                s2 = field_first(t_attrs2, [tracts_meta.get("state_field") or "STATEFP", "STATE"]) or ''
+                                c2 = field_first(t_attrs2, [tracts_meta.get("county_field") or "COUNTYFP", "COUNTY"]) or ''
+                                tc2 = field_first(t_attrs2, [tracts_meta.get("tract_field") or "TRACTCE", "TRACT"]) or ''
+                                tract_geoid2 = f"{str(s2)}{str(c2)}{str(tc2)}"
+                            geom2 = tft.get("geometry")
+                            if not geom2:
+                                continue
+                            # Construct polygon geometry JSON for query
+                            poly_geom = {
+                                "rings": geom2.get("rings", []),
+                                "spatialReference": {"wkid": 4326}
+                            }
+                            try:
+                                geom_str = json.dumps(poly_geom)
+                            except Exception:
+                                continue
+                            taz_q_params = {
+                                "geometry": geom_str,
+                                "geometryType": "esriGeometryPolygon",
+                                "inSR": 4326,
+                                "spatialRel": "esriSpatialRelIntersects",
+                                "outFields": "GEOID,GEOID20,STATEFP,COUNTYFP,TAZ,TAZCE",
+                                "returnGeometry": "false",
+                                "f": "json"
+                            }
+                            tz = _request_with_retry(TAZ_QUERY, taz_q_params)
+                            if not tz or not tz.get("features"):
+                                continue
+                            for tzf in tz.get("features", []):
+                                a = tzf.get("attributes", {})
+                                taz_geoid2 = a.get("GEOID") or a.get("GEOID20")
+                                if not taz_geoid2:
+                                    taz_id2 = a.get("TAZ") or a.get("TAZCE")
+                                    if taz_id2 is None:
+                                        continue
+                                    taz_geoid2 = f"{state_code}{ccc}{str(taz_id2)}"
+                                results.append({"TRACT_GEOID": tract_geoid2, "TAZ_GEOID": taz_geoid2})
+                        # Done with fallback for this county
+                        continue
+
+                    # 2) For each TAZ centroid, find containing tract
+                    for ftr in taz_features:
+                        attrs = ftr.get("attributes", {})
+                        # Prefer GEOID if present; else build from STATE+COUNTY+TAZ (ID field may be 'TAZ')
+                        taz_geoid = attrs.get("GEOID")
+                        if not taz_geoid:
+                            taz_id = attrs.get("TAZ") or attrs.get("taz") or attrs.get("TAZCE")
+                            if taz_id is None:
+                                # As a last resort, skip if we can't identify the TAZ id
+                                continue
+                            taz_geoid = f"{state_code}{ccc}{str(taz_id)}"
+
+                        centroid = ftr.get("centroid") or {}
+                        x = centroid.get("x")
+                        y = centroid.get("y")
+                        if x is None or y is None:
+                            # If centroid missing, optionally fall back to polygon's first coordinate
+                            geom = ftr.get("geometry") or {}
+                            # Attempt to grab a coordinate if polygon exists (rings[0][0])
+                            try:
+                                x, y = geom["rings"][0][0]
+                            except Exception:
+                                continue
+
+                        tract_params = {
+                            "geometry": f"{x},{y}",
+                            "geometryType": "esriGeometryPoint",
+                            "inSR": 4326,
+                            "spatialRel": "esriSpatialRelIntersects",
+                            "outFields": "GEOID,STATEFP,COUNTYFP,TRACTCE,STATE,COUNTY,TRACT",
+                            "returnGeometry": "false",
+                            "f": "json"
+                        }
+                        tdata = _request_with_retry(TRACTS_QUERY, tract_params)
+                        if not tdata or not tdata.get("features"):
+                            continue
+                        t_attrs = tdata["features"][0]["attributes"]
+                        tract_geoid = t_attrs.get("GEOID")
+                        if not tract_geoid:
+                            # Build from parts if GEOID is absent
+                            s = t_attrs.get('STATEFP') or t_attrs.get('STATE') or ''
+                            c = t_attrs.get('COUNTYFP') or t_attrs.get('COUNTY') or ''
+                            t = t_attrs.get('TRACTCE') or t_attrs.get('TRACT') or ''
+                            tract_geoid = f"{str(s)}{str(c)}{str(t)}"
+                        results.append({"TRACT_GEOID": tract_geoid, "TAZ_GEOID": taz_geoid})
+
+                if not results:
+                    return pd.DataFrame(columns=["TRACT_GEOID","TAZ_GEOID"])
+                return pd.DataFrame(results)
+
+            taz_df = fetch_taz_by_tract(arc_counties_list=arc_counties, state_code=state)
+            if taz_df.empty:
+                print("Warning: No TAZ data could be fetched; saving households without TAZ list.")
+            else:
+                # Aggregate to comma-separated unique list per tract
+                agg = (
+                    taz_df.dropna(subset=["TRACT_GEOID","TAZ_GEOID"])\
+                          .groupby("TRACT_GEOID")["TAZ_GEOID"]
+                          .apply(lambda s: ",".join(sorted(pd.unique(s.tolist()))))
+                          .reset_index()
+                          .rename(columns={"TAZ_GEOID":"TAZ_list"})
+                )
+                out_df = out_df.merge(agg, left_on="GEOID", right_on="TRACT_GEOID", how="left")
+                out_df = out_df.drop(columns=[c for c in ["TRACT_GEOID"] if c in out_df.columns])
+
+        save_csv(out_df, "ARC_TotalHouseholds_2023_Tract.csv")
+        print(f"  Saved tract households to {os.path.join(download_dir, 'ARC_TotalHouseholds_2023_Tract.csv')}")
+        print(f"  Rows: {len(out_df)}")
+
+    if tract_households_base:
+        # Roll up tract-level households to base tract (first 4 digits of TRACTCE, e.g., 1801)
+        print("Downloading tract-level total households (B11001) for ARC counties...")
+        tract_df = fetch_tract_table("B11001", arc_counties_list=arc_counties, state_code=state)
+        if tract_df.empty:
+            print("No tract data returned.")
+        else:
+            # Ensure numeric types for estimate and MOE
+            if "B11001_001E" in tract_df.columns:
+                tract_df["B11001_001E"] = pd.to_numeric(tract_df["B11001_001E"], errors="coerce")
+            if "B11001_001M" in tract_df.columns:
+                tract_df["B11001_001M"] = pd.to_numeric(tract_df["B11001_001M"], errors="coerce")
+
+            # Base tract = first 4 chars of the 6-digit TRACTCE string provided by ACS API in column 'tract'
+            # The ACS API returns zero-padded strings already.
+            tract_df["tract_base"] = tract_df["tract"].astype(str).str[:4]
+
+            grp_keys = ["state", "county", "tract_base"]
+
+            # Sum estimates
+            agg_dict = {"B11001_001E": "sum"}
+            has_moe = "B11001_001M" in tract_df.columns
+            if has_moe:
+                # For MOE, combine using root-sum-of-squares across component tracts
+                tract_df["_MOE2"] = tract_df["B11001_001M"] ** 2
+                moe_sq = tract_df.groupby(grp_keys)["_MOE2"].sum().rename("_MOE2_sum")
+
+            est_sum = tract_df.groupby(grp_keys)["B11001_001E"].sum().rename("B11001_001E")
+
+            out_df = est_sum.reset_index()
+            if has_moe:
+                out_df = out_df.merge(moe_sq.reset_index(), on=grp_keys, how="left")
+                out_df["B11001_001M"] = (out_df["_MOE2_sum"].clip(lower=0) ** 0.5).round(0)
+                out_df = out_df.drop(columns=["_MOE2_sum"]) 
+
+            # Construct a 9-digit base GEOID: state(2) + county(3) + tract_base(4)
+            out_df["GEOID_base"] = out_df["state"] + out_df["county"] + out_df["tract_base"]
+
+            # Order columns
+            cols = ["GEOID_base", "state", "county", "tract_base", "B11001_001E"]
+            if has_moe:
+                cols.append("B11001_001M")
+            out_df = out_df[cols]
+
+            # Save
+            save_csv(out_df, "ARC_TotalHouseholds_2023_TractBase.csv")
+            print(f"  Saved base-tract households to {os.path.join(download_dir, 'ARC_TotalHouseholds_2023_TractBase.csv')}")
+            print(f"  Rows: {len(out_df)}")
+
+    elif tract_households or tract_households_with_taz:
         # Tract-level total households from B11001
         print("Downloading tract-level total households (B11001) for ARC counties...")
         tract_df = fetch_tract_table("B11001", arc_counties_list=arc_counties, state_code=state)
-        if not tract_df.empty:
-            # Keep total households estimate and MOE if present
-            keep_cols = [c for c in tract_df.columns if c in {"GEOID","NAME","state","county","tract","B11001_001E","B11001_001M"}]
-            # Ensure at least estimate column exists
-            if "B11001_001E" not in tract_df.columns:
-                print("Warning: B11001_001E not found in response. Saving all variables instead.")
-                out_df = tract_df
-            else:
-                out_df = tract_df[keep_cols]
-            save_csv(out_df, "ARC_TotalHouseholds_2023_Tract.csv")
-            print(f"  Saved tract households to {os.path.join(download_dir, 'ARC_TotalHouseholds_2023_Tract.csv')}")
-            print(f"  Rows: {len(out_df)}")
-        else:
-            print("No tract data returned.")
+        _save_tract_households(tract_df, add_taz=tract_households_with_taz)
     elif not geom_only:
         # 2) Data tables - fetch only for the GEOIDs we have geometries for
         all_mismatches = {}

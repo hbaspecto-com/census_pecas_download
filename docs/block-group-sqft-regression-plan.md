@@ -175,6 +175,7 @@ Example columns:
 ## Questions to Answer
 
 - What is the parcel/building data format: CSV, shapefile, GeoPackage, PostGIS table, file geodatabase, or something else?
+    - Answer: RPD24_V2.gdb
 - What is the exact square footage field we should use?
 - Does that field represent heated living area, total building area, improvement area, or something else?
 - Which field identifies residential properties?
@@ -183,6 +184,14 @@ Example columns:
 - Are there known duplicate parcel/building records?
 - Are vacant residential parcels included, and should they be excluded?
 - Is the parcel data for Cobb only right now, or already available for all ARC counties?
+
+## Working Step 2 Decisions (from  step-2-inventory-parcel-data.md)
+Unique row ID: ARCID_MR
+Parcel ID: apn
+Square-footage field: AreaBuildi
+Square-footage meaning: Combined Square Footage of All Climate Controlled Structures
+Residential filter: PECASResiTranche_MR built-residential categories
+Geometry/assignment inputs: parcel polygon Shape plus latitude/longitude
 
 ---
 

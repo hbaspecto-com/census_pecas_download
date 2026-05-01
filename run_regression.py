@@ -82,10 +82,10 @@ def fetch_block_groups_for_county(
     """
     Fetch block group geography rows for one county from ACS 5-year Detailed Tables.
 
-    We request B11016_001E because the Census API requires at least one data variable.
-    B11016_001E is total households from the household size table.
+    The Census API requires at least one data variable. We request B11016_001E,
+    total households from the household size table, as a useful sanity-check field.
     """
-    url = f"https://api.census.gov/data/{acs_year}/acs/acs5"
+    url = f"https://api.census.gov/data/{acs_year}/{ACS_DATASET}"
 
     params = {
         "get": "NAME,B11016_001E",
@@ -230,6 +230,9 @@ def geography_qa(df: pd.DataFrame, expected_counties: set[str]) -> list[str]:
 
 
 def save_qa_report(lines: list[str], path: Path) -> None:
+    """
+    Save QA report lines to a text file.
+    """
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

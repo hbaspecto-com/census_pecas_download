@@ -10,6 +10,7 @@ Implemented:
 - Step 4: Aggregate residential square footage by block group
 - Step 5: Prepare ACS household predictors
 - Step 6: Join parcel-derived dependent variable to ACS predictors
+- Step 10: Build 4x6 income-by-size household category predictors (I1H1..I4H6)
 """
 
 from pathlib import Path
@@ -86,6 +87,64 @@ STEP8_COBB_DIAGNOSTICS_CSV = OUTPUT_DIR / "regression_step8_diagnostics_cobb.csv
 # Step 9 outputs (Cobb QA/QC checks using selected main model)
 STEP9_COBB_QA_TXT = OUTPUT_DIR / "qa_cobb_bg.txt"
 STEP9_COBB_DIAGNOSTICS_CSV = OUTPUT_DIR / "regression_step9_diagnostics_cobb.csv"
+
+# Step 10 outputs (Cobb 4x6 income-by-size household categories)
+STEP10_COBB_4X6_CSV = OUTPUT_DIR / "regression_acs_4x6_predictors_cobb_2024.csv"
+STEP10_COBB_MODELING_TABLE_CSV = OUTPUT_DIR / "regression_modeling_table_4x6_cobb_bg.csv"
+STEP10_COBB_QA_TXT = OUTPUT_DIR / "qa_step10_4x6_cobb_2024.txt"
+STEP10_COBB_RESULTS_TXT = OUTPUT_DIR / "regression_step10_results_cobb.txt"
+STEP10_COBB_DIAGNOSTICS_CSV = OUTPUT_DIR / "regression_step10_diagnostics_cobb.csv"
+
+# Income group boundaries (in dollars) for the 4x6 ARC household categories.
+# These define the lower bound of each group (except group 1 which starts at 0).
+# Group 1: [0, 27000)
+# Group 2: [27000, 65000)
+# Group 3: [65000, 130000)
+# Group 4: [130000, inf)
+INCOME_GROUP_THRESHOLDS = [27_000, 65_000, 130_000]
+
+# ACS B19001 income bins: (variable_suffix, lower_bound, upper_bound)
+# upper_bound is None for the top-coded bin (200k+).
+ACS_B19001_BINS = [
+    ("002", 0,       10_000),
+    ("003", 10_000,  15_000),
+    ("004", 15_000,  20_000),
+    ("005", 20_000,  25_000),
+    ("006", 25_000,  30_000),
+    ("007", 30_000,  35_000),
+    ("008", 35_000,  40_000),
+    ("009", 40_000,  45_000),
+    ("010", 45_000,  50_000),
+    ("011", 50_000,  60_000),
+    ("012", 60_000,  75_000),
+    ("013", 75_000, 100_000),
+    ("014", 100_000, 125_000),
+    ("015", 125_000, 150_000),
+    ("016", 150_000, 200_000),
+    ("017", 200_000, None),
+]
+
+# Size group labels (H1..H6) and the corresponding B25009 owner + renter columns.
+# B25009: owner-occupied sizes 003-009, renter-occupied sizes 011-017.
+# H6 = 6+ persons combines B25009_008+009 (owner 6, 7+) and B25009_016+017 (renter 6, 7+).
+ACS_B25009_SIZE_COLS = {
+    "H1": ["B25009_003E", "B25009_011E"],
+    "H2": ["B25009_004E", "B25009_012E"],
+    "H3": ["B25009_005E", "B25009_013E"],
+    "H4": ["B25009_006E", "B25009_014E"],
+    "H5": ["B25009_007E", "B25009_015E"],
+    "H6": ["B25009_008E", "B25009_009E", "B25009_016E", "B25009_017E"],
+}
+
+# Income group labels in order.
+INCOME_GROUP_LABELS = ["I1", "I2", "I3", "I4"]
+
+# All 24 4x6 category column names in row-major order (income varies slowest).
+HH_4X6_COLS = [
+    f"{inc}{sz}"
+    for inc in INCOME_GROUP_LABELS
+    for sz in ACS_B25009_SIZE_COLS
+]
 
 # ---------------------------------------------------------------------
 # Geography helpers (Step 1)
@@ -2095,6 +2154,382 @@ def run_step_8_cobb() -> None:
 
 
 # ---------------------------------------------------------------------
+# Step 10 helpers
+# ---------------------------------------------------------------------
+
+def _compute_income_group_shares(df_income: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert B19001 bin counts into 4 income-group counts using linear
+    interpolation within bins that straddle a threshold.
+
+    Income groups:
+      I1: [0, 27000)
+      I2: [27000, 65000)
+      I3: [65000, 130000)
+      I4: [130000, inf)
+
+    For bins that are fully inside one group the full count is assigned.
+    For bins that straddle a threshold the count is split proportionally
+    by the fraction of the bin width that falls in each group.
+
+    Returns a DataFrame with columns GEOID, I1, I2, I3, I4.
+    """
+    thresholds = INCOME_GROUP_THRESHOLDS  # [27000, 65000, 130000]
+    n_groups = len(thresholds) + 1        # 4
+
+    result_rows = []
+
+    for _, row in df_income.iterrows():
+        group_counts = [0.0] * n_groups
+
+        for suffix, lo, hi in ACS_B19001_BINS:
+            col = f"B19001_{suffix}E"
+            count = float(row.get(col, 0) or 0)
+            if count <= 0:
+                continue
+
+            # For the top-coded bin (200k+) treat it as entirely in group 4.
+            if hi is None:
+                group_counts[3] += count
+                continue
+
+            bin_width = hi - lo
+
+            for g_idx in range(n_groups):
+                g_lo = thresholds[g_idx - 1] if g_idx > 0 else 0
+                g_hi = thresholds[g_idx] if g_idx < n_groups - 1 else float("inf")
+
+                overlap_lo = max(lo, g_lo)
+                overlap_hi = min(hi, g_hi)
+
+                if overlap_hi <= overlap_lo:
+                    continue
+
+                fraction = (overlap_hi - overlap_lo) / bin_width
+                group_counts[g_idx] += count * fraction
+
+        result_rows.append(
+            {
+                "GEOID": row["GEOID"],
+                "I1": group_counts[0],
+                "I2": group_counts[1],
+                "I3": group_counts[2],
+                "I4": group_counts[3],
+            }
+        )
+
+    return pd.DataFrame(result_rows)
+
+
+def _build_step10_4x6_predictors() -> pd.DataFrame:
+    """
+    Build the 4x6 income-by-size household category predictors for Cobb.
+
+    Method:
+      1. Fetch B19001 (income distribution) and B25009 (size by tenure).
+      2. Compute income-group counts I1..I4 via linear interpolation within bins.
+      3. Compute size-group counts H1..H6 by summing owner + renter columns.
+      4. Estimate the 24 cross-tab cells using the independence approximation:
+           IxHy = (Ix / total_households) * (Hy / total_households) * total_households
+                = Ix * Hy / total_households
+         Cells are rounded to integers; any rounding remainder is absorbed into
+         the largest cell of each row so that row sums equal total_households.
+
+    Returns a DataFrame with GEOID plus 24 columns I1H1..I4H6.
+    """
+    b19001_vars = [f"B19001_{s}E" for s, _, _ in ACS_B19001_BINS]
+    b25009_vars = [col for cols in ACS_B25009_SIZE_COLS.values() for col in cols]
+    b25009_vars = list(dict.fromkeys(b25009_vars))  # deduplicate, preserve order
+
+    df_income = _fetch_acs_table_for_cobb("B19001", b19001_vars)
+    df_size = _fetch_acs_table_for_cobb("B25009", b25009_vars + ["B25009_001E"])
+
+    df_income = _to_numeric_cols(df_income, b19001_vars)
+    df_size = _to_numeric_cols(df_size, b25009_vars + ["B25009_001E"])
+
+    # Income group counts via interpolation.
+    df_inc_groups = _compute_income_group_shares(df_income)
+
+    # Size group counts by summing owner + renter columns.
+    df_sz = df_size[["GEOID"]].copy()
+    for sz_label, sz_cols in ACS_B25009_SIZE_COLS.items():
+        df_sz[sz_label] = df_size[sz_cols].sum(axis=1)
+
+    df_sz["total_households"] = df_size["B25009_001E"]
+
+    # Merge income groups and size groups on GEOID.
+    df = df_inc_groups.merge(df_sz, on="GEOID", how="inner")
+
+    # Build 24 cross-tab columns using independence approximation.
+    size_labels = list(ACS_B25009_SIZE_COLS.keys())  # H1..H6
+
+    for inc_label in INCOME_GROUP_LABELS:
+        for sz_label in size_labels:
+            col = f"{inc_label}{sz_label}"
+            total = df["total_households"].replace(0, np.nan)
+            df[col] = df[inc_label] * df[sz_label] / total
+
+    # Round to integers and correct row sums so they equal total_households.
+    cross_cols = HH_4X6_COLS
+    df[cross_cols] = df[cross_cols].fillna(0)
+
+    for idx in df.index:
+        total_hh = int(round(df.at[idx, "total_households"]))
+        raw = df.loc[idx, cross_cols].values.astype(float)
+        floored = np.floor(raw).astype(int)
+        remainder = total_hh - floored.sum()
+        if remainder > 0:
+            # Distribute remainder to cells with largest fractional parts.
+            fractions = raw - floored
+            top_indices = np.argsort(fractions)[::-1][:remainder]
+            floored[top_indices] += 1
+        df.loc[idx, cross_cols] = floored
+
+    # Attach geography columns from the Step 5 ACS predictors table.
+    df_cobb_bg = _load_cobb_block_groups_for_step4()[
+        ["GEOID", "state", "county", "tract", "block group", "county_name"]
+    ]
+
+    out = df_cobb_bg.merge(
+        df[["GEOID", "total_households"] + cross_cols],
+        on="GEOID",
+        how="left",
+    )
+
+    for col in ["total_households"] + cross_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).round(0).astype(int)
+
+    return out.sort_values("GEOID").reset_index(drop=True)
+
+
+def _step10_qa_lines(df: pd.DataFrame) -> list[str]:
+    """
+    Build a QA report for the Step 10 4x6 predictor table.
+    """
+    lines = []
+    lines.append("Step 10 QA Report - Cobb 4x6 Income-by-Size Household Predictors")
+    lines.append("=" * 80)
+    lines.append(f"ACS year: {ACS_YEAR}")
+    lines.append(f"Rows: {len(df):,}")
+    lines.append("")
+
+    bad_geoid_len = df[df["GEOID"].astype(str).str.len() != 12]
+    bad_geoid_prefix = df[~df["GEOID"].astype(str).str.startswith("13067")]
+    dup_geoid = df[df["GEOID"].duplicated(keep=False)]
+
+    lines.append("GEOID checks:")
+    lines.append(
+        "PASS: All GEOIDs are 12 characters."
+        if bad_geoid_len.empty else f"FAIL: {len(bad_geoid_len):,} GEOIDs not 12 characters."
+    )
+    lines.append(
+        "PASS: All GEOIDs start with 13067."
+        if bad_geoid_prefix.empty else f"FAIL: {len(bad_geoid_prefix):,} GEOIDs not in Cobb prefix."
+    )
+    lines.append(
+        "PASS: No duplicate GEOIDs."
+        if dup_geoid.empty else f"FAIL: {len(dup_geoid):,} duplicate GEOID rows."
+    )
+    lines.append("")
+
+    # Row-sum check: sum of 24 cells should equal total_households.
+    row_sums = df[HH_4X6_COLS].sum(axis=1)
+    diff = (row_sums - df["total_households"]).abs()
+    lines.append("Row-sum checks (24 cells vs total_households):")
+    lines.append(f"  Max absolute difference: {diff.max():,.0f}")
+    lines.append(f"  Rows with difference > 1: {int((diff > 1).sum()):,}")
+    lines.append("")
+
+    # Income marginal check: I1+I2+I3+I4 should equal total_households.
+    inc_sum = df[["I1H1","I1H2","I1H3","I1H4","I1H5","I1H6",
+                  "I2H1","I2H2","I2H3","I2H4","I2H5","I2H6",
+                  "I3H1","I3H2","I3H3","I3H4","I3H5","I3H6",
+                  "I4H1","I4H2","I4H3","I4H4","I4H5","I4H6"]].sum(axis=1)
+    lines.append("Income group marginal totals (sample means):")
+    for inc_label in INCOME_GROUP_LABELS:
+        inc_cols = [c for c in HH_4X6_COLS if c.startswith(inc_label)]
+        lines.append(
+            f"  {inc_label}: mean={df[inc_cols].sum(axis=1).mean():,.1f}, "
+            f"total={df[inc_cols].sum(axis=1).sum():,.0f}"
+        )
+    lines.append("")
+
+    lines.append("Size group marginal totals (sample means):")
+    for sz_label in ACS_B25009_SIZE_COLS:
+        sz_cols = [c for c in HH_4X6_COLS if c.endswith(sz_label)]
+        lines.append(
+            f"  {sz_label}: mean={df[sz_cols].sum(axis=1).mean():,.1f}, "
+            f"total={df[sz_cols].sum(axis=1).sum():,.0f}"
+        )
+    lines.append("")
+
+    lines.append(f"Block groups with total_households = 0: {int((df['total_households'] == 0).sum()):,}")
+    lines.append(f"Total households across all block groups: {df['total_households'].sum():,}")
+    lines.append("")
+
+    lines.append("Column totals for all 24 categories:")
+    for col in HH_4X6_COLS:
+        lines.append(f"  {col}: {df[col].sum():,}")
+
+    return lines
+
+
+def _build_step10_modeling_table(df_4x6: pd.DataFrame) -> pd.DataFrame:
+    """
+    Join the 4x6 predictor table to the Step 4 parcel-derived dependent variable.
+    """
+    df_sqft = _load_step4_cobb_res_sqft()
+
+    sqft_cols = [
+        "GEOID",
+        "total_res_sqft",
+        "residential_record_count",
+        "zero_res_sqft_record_count",
+        "missing_res_sqft_record_count",
+    ]
+    sqft_cols = [c for c in sqft_cols if c in df_sqft.columns]
+
+    out = df_4x6.merge(df_sqft[sqft_cols], on="GEOID", how="left", indicator=True)
+    out["parcel_join_status"] = out["_merge"].map(
+        {"both": "matched", "left_only": "missing_parcel_sqft"}
+    )
+    out = out.drop(columns=["_merge"])
+
+    for col in ["total_res_sqft", "residential_record_count",
+                "zero_res_sqft_record_count", "missing_res_sqft_record_count"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).round(0).astype("int64")
+
+    preferred_order = (
+        ["GEOID", "state", "county", "county_name", "tract", "block group",
+         "total_res_sqft", "residential_record_count", "parcel_join_status",
+         "total_households"]
+        + HH_4X6_COLS
+    )
+    ordered = [c for c in preferred_order if c in out.columns]
+    remaining = [c for c in out.columns if c not in ordered]
+    return out[ordered + remaining].sort_values("GEOID").reset_index(drop=True)
+
+
+def _fit_step10_model(df_reg: pd.DataFrame) -> dict:
+    """
+    Fit the 4x6 model:
+      total_res_sqft ~ I1H1 + I1H2 + ... + I4H6  (no intercept, all 24 predictors)
+    """
+    return _fit_ols(
+        df=df_reg,
+        y_col="total_res_sqft",
+        x_cols=HH_4X6_COLS,
+        model_name="Step 10: 4x6 Income-by-Size (no intercept)",
+        include_intercept=False,
+    )
+
+
+def _step10_report_lines(result: dict, diagnostics: pd.DataFrame) -> list[str]:
+    """
+    Build the Step 10 regression results report.
+    """
+    lines = []
+    lines.append("Step 10 Regression Results - Cobb 4x6 Income-by-Size Model")
+    lines.append("=" * 80)
+    lines.append(f"ACS year: {ACS_YEAR}")
+    lines.append("Model: total_res_sqft ~ I1H1 + ... + I4H6 (no intercept, all 24 predictors)")
+    lines.append(
+        "Income groups: I1=[0,27k), I2=[27k,65k), I3=[65k,130k), I4=[130k+)"
+    )
+    lines.append(
+        "Size groups: H1=1 person, H2=2, H3=3, H4=4, H5=5, H6=6+"
+    )
+    lines.append(
+        "Cross-tab method: independence approximation "
+        "(income_share x size_share x total_households)"
+    )
+    lines.append("")
+
+    lines.extend(_format_ols_summary(result))
+
+    mape = _mean_absolute_percent_error(result["predictions"], result["y_col"])
+    lines.append(f"MAPE (excluding zero observed): {mape:.6f}")
+
+    obs_pred_corr = (
+        diagnostics[["observed_res_sqft", "predicted_total_res_sqft"]]
+        .corr()
+        .iloc[0, 1]
+    )
+    lines.append(f"Observed vs. predicted correlation: {obs_pred_corr:.6f}")
+    lines.append("")
+
+    lines.append("Largest positive residuals (observed > predicted):")
+    lines.append("-" * 80)
+    for _, row in diagnostics.sort_values("residual", ascending=False).head(10).iterrows():
+        ape = row["abs_pct_error"]
+        ape_txt = "NA" if pd.isna(ape) else f"{ape:.3f}"
+        lines.append(
+            f"{row['GEOID']}: observed={row['observed_res_sqft']:,.0f}, "
+            f"predicted={row['predicted_total_res_sqft']:,.0f}, "
+            f"residual={row['residual']:,.0f}, abs_pct_error={ape_txt}"
+        )
+
+    lines.append("")
+    lines.append("Largest negative residuals (observed < predicted):")
+    lines.append("-" * 80)
+    for _, row in diagnostics.sort_values("residual", ascending=True).head(10).iterrows():
+        ape = row["abs_pct_error"]
+        ape_txt = "NA" if pd.isna(ape) else f"{ape:.3f}"
+        lines.append(
+            f"{row['GEOID']}: observed={row['observed_res_sqft']:,.0f}, "
+            f"predicted={row['predicted_total_res_sqft']:,.0f}, "
+            f"residual={row['residual']:,.0f}, abs_pct_error={ape_txt}"
+        )
+
+    lines.append("")
+    return lines
+
+
+# ---------------------------------------------------------------------
+# Step 10 runner
+# ---------------------------------------------------------------------
+
+def run_step_10_cobb() -> None:
+    """
+    Step 10:
+    Build 4x6 income-by-size household category predictors for Cobb County,
+    join to parcel-derived square footage, run the 4x6 regression, and save
+    QA reports and diagnostics.
+    """
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    print("Building 4x6 income-by-size predictors...")
+    df_4x6 = _build_step10_4x6_predictors()
+    df_4x6.to_csv(STEP10_COBB_4X6_CSV, index=False)
+    print(f"Saved 4x6 predictor table: {STEP10_COBB_4X6_CSV}")
+
+    qa_lines = _step10_qa_lines(df_4x6)
+    save_qa_report(qa_lines, STEP10_COBB_QA_TXT)
+    print(f"Saved Step 10 QA report: {STEP10_COBB_QA_TXT}")
+
+    df_model = _build_step10_modeling_table(df_4x6)
+    df_model.to_csv(STEP10_COBB_MODELING_TABLE_CSV, index=False)
+    print(f"Saved Step 10 modeling table: {STEP10_COBB_MODELING_TABLE_CSV}")
+
+    df_reg = df_model[df_model["total_households"] > 0].copy()
+
+    result = _fit_step10_model(df_reg)
+
+    diagnostics = _build_step8_diagnostics(
+        df_model=df_reg,
+        result=result,
+        diagnostic_model_label=result["model_name"],
+    )
+    diagnostics.to_csv(STEP10_COBB_DIAGNOSTICS_CSV, index=False)
+    print(f"Saved Step 10 diagnostics: {STEP10_COBB_DIAGNOSTICS_CSV}")
+
+    report_lines = _step10_report_lines(result, diagnostics)
+    save_qa_report(report_lines, STEP10_COBB_RESULTS_TXT)
+    print(f"Saved Step 10 regression results: {STEP10_COBB_RESULTS_TXT}")
+
+
+# ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
 
@@ -2138,6 +2573,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run Step 9 Cobb QA/QC checks using selected Model B.",
     )
+    parser.add_argument(
+        "--step10-cobb",
+        action="store_true",
+        help="Run Step 10 Cobb 4x6 income-by-size household category regression.",
+    )
     return parser.parse_args()
 
 
@@ -2153,6 +2593,7 @@ if __name__ == "__main__":
         and not args.step7_cobb
         and not args.step8_cobb
         and not args.step9_cobb
+        and not args.step10_cobb
     ):
         run_step_9_cobb()
     else:
@@ -2170,3 +2611,5 @@ if __name__ == "__main__":
             run_step_8_cobb()
         if args.step9_cobb:
             run_step_9_cobb()
+        if args.step10_cobb:
+            run_step_10_cobb()

@@ -1,0 +1,498 @@
+
+-- psql script to load ACS 2023 Block Group datasets into PostGIS
+-- Usage:
+--   psql -h leduc.office.hbaspecto.com -d atlanta_db -U postgres -f load-postgis.sql
+
+\set ON_ERROR_STOP on
+
+-- Ensure PostGIS and target schema exist
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE SCHEMA IF NOT EXISTS acs_5yr_2023;
+
+-- =====================================
+-- Geometry base table (WKT -> geometry)
+-- =====================================
+DROP TABLE IF EXISTS acs_5yr_2023.arc_bg_geom_2023 CASCADE;
+CREATE TABLE acs_5yr_2023.arc_bg_geom_2023 (
+  geoid text PRIMARY KEY,
+  state text,
+  county text,
+  tract text,
+  block_group text,
+  wkt text
+);
+
+\copy acs_5yr_2023.arc_bg_geom_2023 (geoid,state,county,tract,block_group,wkt) FROM '/nfs/home/sja/repos/census_pecas_download/downloads/ARC_BG_Geometries_2023.csv' WITH (FORMAT csv, HEADER true)
+
+ALTER TABLE acs_5yr_2023.arc_bg_geom_2023 ADD COLUMN geom geometry(MultiPolygon, 4326);
+UPDATE acs_5yr_2023.arc_bg_geom_2023
+SET geom = ST_Multi(ST_GeomFromText(wkt, 4326));
+CREATE INDEX arc_bg_geom_2023_gix ON acs_5yr_2023.arc_bg_geom_2023 USING GIST (geom);
+
+-- ==================
+-- UnitsInStructure
+-- ==================
+DROP TABLE IF EXISTS acs_5yr_2023.arc_unitsinstructure_2023_bg CASCADE;
+CREATE TABLE acs_5yr_2023.arc_unitsinstructure_2023_bg (
+  geoid text PRIMARY KEY,
+  name text,
+  state text,
+  county text,
+  tract text,
+  block_group text,
+  B25024_001E integer,
+  B25024_001M integer,
+  B25024_008E integer,
+  B25024_007E integer,
+  B25024_007M integer,
+  B25024_006E integer,
+  B25024_006M integer,
+  B25024_009M integer,
+  B25024_009E integer,
+  B25024_008M integer,
+  B25024_003E integer,
+  B25024_003M integer,
+  B25024_002E integer,
+  B25024_002M integer,
+  B25024_005E integer,
+  B25024_005M integer,
+  B25024_004E integer,
+  B25024_004M integer,
+  B25024_011E integer,
+  B25024_011M integer,
+  B25024_010M integer,
+  B25024_010E integer,
+  B25024_004MA integer,
+  B25024_004EA integer,
+  B25024_003MA integer,
+  B25024_003EA integer,
+  B25024_002MA integer,
+  B25024_002EA integer,
+  B25024_001EA integer,
+  B25024_001MA integer,
+  B25024_009EA integer,
+  B25024_009MA integer,
+  B25024_008EA integer,
+  B25024_008MA integer,
+  B25024_007EA integer,
+  B25024_007MA integer,
+  B25024_006EA integer,
+  B25024_006MA integer,
+  B25024_005MA integer,
+  B25024_005EA integer,
+  B25024_011EA integer,
+  B25024_011MA integer,
+  B25024_010EA integer,
+  B25024_010MA integer
+);
+
+\copy acs_5yr_2023.arc_unitsinstructure_2023_bg FROM '/nfs/home/sja/repos/census_pecas_download/downloads/ARC_UnitsInStructure_2023_BG.csv' WITH (FORMAT csv, HEADER true)
+
+DROP VIEW IF EXISTS acs_5yr_2023.v_arc_unitsinstructure_2023_bg;
+CREATE VIEW acs_5yr_2023.v_arc_unitsinstructure_2023_bg AS
+SELECT g.geom, d.*
+FROM acs_5yr_2023.arc_bg_geom_2023 g
+JOIN acs_5yr_2023.arc_unitsinstructure_2023_bg d ON d.geoid = g.geoid;
+
+-- ======
+-- Tenure
+-- ======
+DROP TABLE IF EXISTS acs_5yr_2023.arc_tenure_2023_bg CASCADE;
+CREATE TABLE acs_5yr_2023.arc_tenure_2023_bg (
+  geoid text PRIMARY KEY,
+  name text,
+  state text,
+  county text,
+  tract text,
+  block_group text,
+  B25003_003E integer,
+  B25003_003M integer,
+  B25003_002E integer,
+  B25003_002M integer,
+  B25003_001E integer,
+  B25003_001M integer,
+  B25003_001EA integer,
+  B25003_001MA integer,
+  B25003_002MA integer,
+  B25003_002EA integer,
+  B25003_003MA integer,
+  B25003_003EA integer
+);
+
+\copy acs_5yr_2023.arc_tenure_2023_bg FROM '/nfs/home/sja/repos/census_pecas_download/downloads/ARC_Tenure_2023_BG.csv' WITH (FORMAT csv, HEADER true)
+
+DROP VIEW IF EXISTS acs_5yr_2023.v_arc_tenure_2023_bg;
+CREATE VIEW acs_5yr_2023.v_arc_tenure_2023_bg AS
+SELECT g.geom, d.*
+FROM acs_5yr_2023.arc_bg_geom_2023 g
+JOIN acs_5yr_2023.arc_tenure_2023_bg d ON d.geoid = g.geoid;
+
+-- ================
+-- TenureByHHSize
+-- ================
+DROP TABLE IF EXISTS acs_5yr_2023.arc_tenurebyhhsize_2023_bg CASCADE;
+CREATE TABLE acs_5yr_2023.arc_tenurebyhhsize_2023_bg (
+  geoid text PRIMARY KEY,
+  name text,
+  state text,
+  county text,
+  tract text,
+  block_group text,
+  B25009_016EA integer,
+  B25009_015MA integer,
+  B25009_015EA integer,
+  B25009_014EA integer,
+  B25009_014MA integer,
+  B25009_017MA integer,
+  B25009_017EA integer,
+  B25009_016MA integer,
+  B25009_011MA integer,
+  B25009_011EA integer,
+  B25009_010MA integer,
+  B25009_010EA integer,
+  B25009_013EA integer,
+  B25009_013MA integer,
+  B25009_012EA integer,
+  B25009_012MA integer,
+  B25009_017M integer,
+  B25009_013E integer,
+  B25009_012M integer,
+  B25009_012E integer,
+  B25009_011E integer,
+  B25009_011M integer,
+  B25009_010E integer,
+  B25009_010M integer,
+  B25009_017E integer,
+  B25009_016M integer,
+  B25009_016E integer,
+  B25009_015M integer,
+  B25009_015E integer,
+  B25009_014M integer,
+  B25009_014E integer,
+  B25009_013M integer,
+  B25009_009E integer,
+  B25009_009M integer,
+  B25009_008M integer,
+  B25009_008E integer,
+  B25009_007M integer,
+  B25009_007E integer,
+  B25009_006M integer,
+  B25009_006E integer,
+  B25009_005M integer,
+  B25009_001E integer,
+  B25009_005E integer,
+  B25009_004M integer,
+  B25009_004E integer,
+  B25009_003M integer,
+  B25009_003E integer,
+  B25009_002M integer,
+  B25009_002E integer,
+  B25009_001M integer,
+  B25009_007EA integer,
+  B25009_006MA integer,
+  B25009_006EA integer,
+  B25009_005MA integer,
+  B25009_009EA integer,
+  B25009_009MA integer,
+  B25009_008EA integer,
+  B25009_008MA integer,
+  B25009_007MA integer,
+  B25009_002EA integer,
+  B25009_002MA integer,
+  B25009_001EA integer,
+  B25009_001MA integer,
+  B25009_005EA integer,
+  B25009_004MA integer,
+  B25009_004EA integer,
+  B25009_003EA integer,
+  B25009_003MA integer
+);
+
+\copy acs_5yr_2023.arc_tenurebyhhsize_2023_bg FROM '/nfs/home/sja/repos/census_pecas_download/downloads/ARC_TenureByHHSize_2023_BG.csv' WITH (FORMAT csv, HEADER true)
+
+DROP VIEW IF EXISTS acs_5yr_2023.v_arc_tenurebyhhsize_2023_bg;
+CREATE VIEW acs_5yr_2023.v_arc_tenurebyhhsize_2023_bg AS
+SELECT g.geom, d.*
+FROM acs_5yr_2023.arc_bg_geom_2023 g
+JOIN acs_5yr_2023.arc_tenurebyhhsize_2023_bg d ON d.geoid = g.geoid;
+
+-- =============
+-- HouseholdSize
+-- =============
+DROP TABLE IF EXISTS acs_5yr_2023.arc_householdsize_2023_bg CASCADE;
+CREATE TABLE acs_5yr_2023.arc_householdsize_2023_bg (
+    geoid text PRIMARY KEY,
+    name text,
+    state text,
+    county text,
+    tract text,
+    block_group text,
+    B11016_011MA integer,
+    B11016_011EA integer,
+    B11016_012MA integer,
+    B11016_012EA integer,
+    B11016_010EA integer,
+    B11016_010MA integer,
+    B11016_015MA integer,
+    B11016_016EA integer,
+    B11016_016MA integer,
+    B11016_013MA integer,
+    B11016_013EA integer,
+    B11016_014MA integer,
+    B11016_014EA integer,
+    B11016_015EA integer,
+    B11016_002E integer,
+    B11016_001M integer,
+    B11016_001E integer,
+    B11016_003E integer,
+    B11016_002M integer,
+    B11016_009M integer,
+    B11016_008E integer,
+    B11016_007M integer,
+    B11016_009E integer,
+    B11016_008M integer,
+    B11016_006E integer,
+    B11016_005M integer,
+    B11016_007E integer,
+    B11016_006M integer,
+    B11016_004E integer,
+    B11016_003M integer,
+    B11016_005E integer,
+    B11016_004M integer,
+    B11016_014E integer,
+    B11016_013M integer,
+    B11016_015E integer,
+    B11016_014M integer,
+    B11016_011M integer,
+    B11016_011E integer,
+    B11016_013E integer,
+    B11016_012M integer,
+    B11016_012E integer,
+    B11016_010M integer,
+    B11016_010E integer,
+    B11016_016E integer,
+    B11016_015M integer,
+    B11016_016M integer,
+    B11016_009MA integer,
+    B11016_009EA integer,
+    B11016_006MA integer,
+    B11016_007MA integer,
+    B11016_007EA integer,
+    B11016_008MA integer,
+    B11016_008EA integer,
+    B11016_004MA integer,
+    B11016_005EA integer,
+    B11016_005MA integer,
+    B11016_006EA integer,
+    B11016_002MA integer,
+    B11016_002EA integer,
+    B11016_003MA integer,
+    B11016_003EA integer,
+    B11016_004EA integer,
+    B11016_001MA integer,
+    B11016_001EA integer
+);
+
+\copy acs_5yr_2023.arc_householdsize_2023_bg FROM '/nfs/home/sja/repos/census_pecas_download/downloads/ARC_HouseholdSize_2023_BG.csv' WITH (FORMAT csv, HEADER true)
+
+DROP VIEW IF EXISTS acs_5yr_2023.v_arc_householdsize_2023_bg;
+CREATE VIEW acs_5yr_2023.v_arc_householdsize_2023_bg AS
+SELECT d.*, g.geom
+FROM acs_5yr_2023.arc_bg_geom_2023 g
+JOIN acs_5yr_2023.arc_householdsize_2023_bg d ON d.geoid = g.geoid;
+
+-- ==========
+-- IncomeDist
+-- ==========
+DROP TABLE IF EXISTS acs_5yr_2023.arc_incomedist_2023_bg CASCADE;
+CREATE TABLE acs_5yr_2023.arc_incomedist_2023_bg (
+  geoid text PRIMARY KEY,
+  name text,
+  state text,
+  county text,
+  tract text,
+  block_group text,
+  B19001_001MA integer,
+  B19001_001EA integer,
+  B19001_003EA integer,
+  B19001_002MA integer,
+  B19001_002EA integer,
+  B19001_006E integer,
+  B19001_006M integer,
+  B19001_007E integer,
+  B19001_007M integer,
+  B19001_008E integer,
+  B19001_008M integer,
+  B19001_009E integer,
+  B19001_009M integer,
+  B19001_002M integer,
+  B19001_002E integer,
+  B19001_003M integer,
+  B19001_003E integer,
+  B19001_004M integer,
+  B19001_004E integer,
+  B19001_005M integer,
+  B19001_005E integer,
+  B19001_001M integer,
+  B19001_001E integer,
+  B19001_014M integer,
+  B19001_014E integer,
+  B19001_015M integer,
+  B19001_015E integer,
+  B19001_016M integer,
+  B19001_016E integer,
+  B19001_017E integer,
+  B19001_017M integer,
+  B19001_010M integer,
+  B19001_010E integer,
+  B19001_011M integer,
+  B19001_011E integer,
+  B19001_012M integer,
+  B19001_012E integer,
+  B19001_013M integer,
+  B19001_013E integer,
+  B19001_017EA integer,
+  B19001_016MA integer,
+  B19001_017MA integer,
+  B19001_010MA integer,
+  B19001_010EA integer,
+  B19001_011MA integer,
+  B19001_011EA integer,
+  B19001_015EA integer,
+  B19001_014MA integer,
+  B19001_016EA integer,
+  B19001_015MA integer,
+  B19001_012MA integer,
+  B19001_012EA integer,
+  B19001_014EA integer,
+  B19001_013MA integer,
+  B19001_013EA integer,
+  B19001_006EA integer,
+  B19001_005MA integer,
+  B19001_007MA integer,
+  B19001_007EA integer,
+  B19001_006MA integer,
+  B19001_004EA integer,
+  B19001_003MA integer,
+  B19001_005EA integer,
+  B19001_004MA integer,
+  B19001_008MA integer,
+  B19001_008EA integer,
+  B19001_009MA integer,
+  B19001_009EA integer
+);
+
+\copy acs_5yr_2023.arc_incomedist_2023_bg FROM '/nfs/home/sja/repos/census_pecas_download/downloads/ARC_IncomeDist_2023_BG.csv' WITH (FORMAT csv, HEADER true)
+
+DROP VIEW IF EXISTS acs_5yr_2023.v_arc_incomedist_2023_bg;
+CREATE VIEW acs_5yr_2023.v_arc_incomedist_2023_bg AS
+SELECT g.geom, d.*
+FROM acs_5yr_2023.arc_bg_geom_2023 g
+JOIN acs_5yr_2023.arc_incomedist_2023_bg d ON d.geoid = g.geoid;
+
+-- =============
+-- RaceEthnicity
+-- =============
+DROP TABLE IF EXISTS acs_5yr_2023.arc_raceethnicity_2023_bg CASCADE;
+CREATE TABLE acs_5yr_2023.arc_raceethnicity_2023_bg (
+  geoid text PRIMARY KEY,
+  name text,
+  state text,
+  county text,
+  tract text,
+  block_group text,
+  B03002_021EA integer,
+  B03002_021MA integer,
+  B03002_020MA integer,
+  B03002_020EA integer,
+  B03002_012EA integer,
+  B03002_012MA integer,
+  B03002_013MA integer,
+  B03002_013EA integer,
+  B03002_014MA integer,
+  B03002_014EA integer,
+  B03002_015MA integer,
+  B03002_015EA integer,
+  B03002_010EA integer,
+  B03002_010MA integer,
+  B03002_011EA integer,
+  B03002_011MA integer,
+  B03002_016MA integer,
+  B03002_016EA integer,
+  B03002_017EA integer,
+  B03002_017MA integer,
+  B03002_018EA integer,
+  B03002_018MA integer,
+  B03002_019EA integer,
+  B03002_019MA integer,
+  B03002_021E integer,
+  B03002_021M integer,
+  B03002_020E integer,
+  B03002_020M integer,
+  B03002_001E integer,
+  B03002_001M integer,
+  B03002_005E integer,
+  B03002_005M integer,
+  B03002_004E integer,
+  B03002_004M integer,
+  B03002_003E integer,
+  B03002_003M integer,
+  B03002_002E integer,
+  B03002_002M integer,
+  B03002_009M integer,
+  B03002_008M integer,
+  B03002_009E integer,
+  B03002_007E integer,
+  B03002_007M integer,
+  B03002_008E integer,
+  B03002_006E integer,
+  B03002_006M integer,
+  B03002_013E integer,
+  B03002_013M integer,
+  B03002_012E integer,
+  B03002_012M integer,
+  B03002_011E integer,
+  B03002_011M integer,
+  B03002_010E integer,
+  B03002_010M integer,
+  B03002_017E integer,
+  B03002_017M integer,
+  B03002_016E integer,
+  B03002_016M integer,
+  B03002_015E integer,
+  B03002_015M integer,
+  B03002_014E integer,
+  B03002_014M integer,
+  B03002_019M integer,
+  B03002_018E integer,
+  B03002_018M integer,
+  B03002_019E integer,
+  B03002_001EA integer,
+  B03002_001MA integer,
+  B03002_002MA integer,
+  B03002_002EA integer,
+  B03002_007EA integer,
+  B03002_007MA integer,
+  B03002_008EA integer,
+  B03002_008MA integer,
+  B03002_009EA integer,
+  B03002_009MA integer,
+  B03002_003MA integer,
+  B03002_003EA integer,
+  B03002_004MA integer,
+  B03002_004EA integer,
+  B03002_005MA integer,
+  B03002_005EA integer,
+  B03002_006EA integer,
+  B03002_006MA integer
+);
+
+\copy acs_5yr_2023.arc_raceethnicity_2023_bg FROM '/nfs/home/sja/repos/census_pecas_download/downloads/ARC_RaceEthnicity_2023_BG.csv' WITH (FORMAT csv, HEADER true)
+
+DROP VIEW IF EXISTS acs_5yr_2023.v_arc_raceethnicity_2023_bg;
+CREATE VIEW acs_5yr_2023.v_arc_raceethnicity_2023_bg AS
+SELECT g.geom, d.*
+FROM acs_5yr_2023.arc_bg_geom_2023 g
+JOIN acs_5yr_2023.arc_raceethnicity_2023_bg d ON d.geoid = g.geoid;
+
+\echo Done. You can now query the v_arc_* views as GIS layers.

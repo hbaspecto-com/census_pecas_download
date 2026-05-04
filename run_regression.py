@@ -83,6 +83,10 @@ STEP8_COBB_MODEL_COMPARISON_CSV = OUTPUT_DIR / "regression_step8_model_compariso
 STEP8_COBB_RESULTS_TXT = OUTPUT_DIR / "regression_step8_results_cobb.txt"
 STEP8_COBB_DIAGNOSTICS_CSV = OUTPUT_DIR / "regression_step8_diagnostics_cobb.csv"
 
+# Step 9 outputs (Cobb QA/QC checks using selected main model)
+STEP9_COBB_QA_TXT = OUTPUT_DIR / "qa_cobb_bg.txt"
+STEP9_COBB_DIAGNOSTICS_CSV = OUTPUT_DIR / "regression_step9_diagnostics_cobb.csv"
+
 # ---------------------------------------------------------------------
 # Geography helpers (Step 1)
 # ---------------------------------------------------------------------
@@ -1566,6 +1570,323 @@ def _build_step8_diagnostics(
 
     return diag.sort_values(sort_col, ascending=False).reset_index(drop=True)
 
+# ---------------------------------------------------------------------
+# Step 9 helpers
+# ---------------------------------------------------------------------
+
+def _fit_step9_model_b(df_reg: pd.DataFrame) -> dict:
+    """
+    Fit selected Step 9 QC model.
+
+    Selected model:
+      B: total_res_sqft ~ total_households + income shares
+
+    Income $100k+ is the omitted/reference income-share category.
+    """
+    income_share_cols_reference_100k = [
+        "share_income_lt_25k",
+        "share_income_25k_50k",
+        "share_income_50k_100k",
+    ]
+
+    return _fit_ols(
+        df=df_reg,
+        y_col="total_res_sqft",
+        x_cols=["total_households"] + income_share_cols_reference_100k,
+        model_name="B: Total HH + Income Shares",
+        include_intercept=True,
+    )
+
+
+def _step9_sign_check_lines(result: dict) -> list[str]:
+    """
+    Build coefficient sign checks for the selected Step 9 model.
+    """
+    lines = []
+    coef = result["coefficients"].set_index("term")["coefficient"]
+
+    lines.append("Coefficient sign checks:")
+    total_hh_coef = coef.get("total_households", np.nan)
+    lines.append(
+        "PASS: total_households coefficient is positive."
+        if total_hh_coef > 0
+        else f"WARN: total_households coefficient is not positive: {total_hh_coef:,.6f}"
+    )
+
+    for term in [
+        "share_income_lt_25k",
+        "share_income_25k_50k",
+        "share_income_50k_100k",
+    ]:
+        value = coef.get(term, np.nan)
+        lines.append(
+            f"INFO: {term} coefficient = {value:,.6f} "
+            "relative to omitted share_income_100k_plus."
+        )
+
+    return lines
+
+
+def _step9_qa_lines(
+    df_model: pd.DataFrame,
+    df_reg: pd.DataFrame,
+    diagnostics: pd.DataFrame,
+    result: dict,
+) -> list[str]:
+    """
+    Build Step 9 QA/QC report for Cobb using selected Model B.
+    """
+    lines = []
+
+    lines.append("Step 9 QA/QC Report - Cobb Block Group Regression")
+    lines.append("=" * 80)
+    lines.append(f"ACS year: {ACS_YEAR}")
+    lines.append("Selected model: B: Total HH + Income Shares")
+    lines.append("Model form: total_res_sqft ~ total_households + income shares")
+    lines.append("Reference income-share category: share_income_100k_plus")
+    lines.append("QA behavior: warnings are reported; checks do not stop the script.")
+    lines.append("")
+
+    lines.append("Geography checks")
+    lines.append("-" * 80)
+    lines.append(f"Modeling table rows: {len(df_model):,}")
+    lines.append(f"Regression rows with total_households > 0: {len(df_reg):,}")
+
+    bad_geoid_len = df_model[df_model["GEOID"].astype(str).str.len() != 12]
+    bad_geoid_prefix = df_model[~df_model["GEOID"].astype(str).str.startswith("13067")]
+    duplicated_geoids = df_model[df_model["GEOID"].duplicated(keep=False)]
+
+    lines.append(
+        "PASS: All GEOIDs are 12 characters."
+        if bad_geoid_len.empty
+        else f"FAIL: {len(bad_geoid_len):,} GEOIDs are not 12 characters."
+    )
+    lines.append(
+        "PASS: All Cobb GEOIDs start with 13067."
+        if bad_geoid_prefix.empty
+        else f"FAIL: {len(bad_geoid_prefix):,} GEOIDs do not start with 13067."
+    )
+    lines.append(
+        "PASS: Modeling table has one row per GEOID."
+        if duplicated_geoids.empty
+        else f"FAIL: {len(duplicated_geoids):,} duplicate GEOID rows found."
+    )
+    lines.append("")
+
+    lines.append("Parcel checks")
+    lines.append("-" * 80)
+    lines.append(f"Total residential square feet: {df_model['total_res_sqft'].sum():,.0f}")
+    lines.append(f"Total residential records: {df_model['residential_record_count'].sum():,.0f}")
+
+    parcel_check_cols = [
+        "total_res_sqft",
+        "residential_record_count",
+        "zero_res_sqft_record_count",
+        "missing_res_sqft_record_count",
+    ]
+    for col in parcel_check_cols:
+        if col in df_model.columns:
+            lines.append(f"{col} missing values: {int(df_model[col].isna().sum()):,}")
+
+    lines.append(f"Block groups with zero residential sqft: {int((df_model['total_res_sqft'] == 0).sum()):,}")
+    lines.append(f"Block groups with zero residential records: {int((df_model['residential_record_count'] == 0).sum()):,}")
+
+    if "parcel_join_status" in df_model.columns:
+        lines.append("Parcel join status counts:")
+        for status, count in df_model["parcel_join_status"].value_counts(dropna=False).sort_index().items():
+            lines.append(f"  {status}: {count:,}")
+
+    sqft_extreme_threshold = df_model["total_res_sqft"].quantile(0.99)
+    extreme_sqft = df_model[df_model["total_res_sqft"] >= sqft_extreme_threshold]
+    lines.append(f"99th percentile total_res_sqft threshold: {sqft_extreme_threshold:,.0f}")
+    lines.append(f"Block groups at/above 99th percentile total_res_sqft: {len(extreme_sqft):,}")
+    lines.append("")
+
+    lines.append("ACS checks")
+    lines.append("-" * 80)
+
+    predictor_cols = [
+        "total_households",
+        "hh_size_1",
+        "hh_size_2",
+        "hh_size_3",
+        "hh_size_4",
+        "hh_size_5",
+        "hh_size_6plus",
+        "hh_income_lt_25k",
+        "hh_income_25k_50k",
+        "hh_income_50k_100k",
+        "hh_income_100k_plus",
+    ]
+
+    for col in predictor_cols:
+        if col in df_model.columns:
+            lines.append(f"{col} missing values: {int(df_model[col].isna().sum()):,}")
+
+    negative_count = int((df_model[predictor_cols] < 0).sum().sum())
+    lines.append(
+        "PASS: No negative ACS predictor values."
+        if negative_count == 0
+        else f"FAIL: Found {negative_count:,} negative ACS predictor values."
+    )
+
+    size_sum = (
+        df_model["hh_size_1"]
+        + df_model["hh_size_2"]
+        + df_model["hh_size_3"]
+        + df_model["hh_size_4"]
+        + df_model["hh_size_5"]
+        + df_model["hh_size_6plus"]
+    )
+    income_sum = (
+        df_model["hh_income_lt_25k"]
+        + df_model["hh_income_25k_50k"]
+        + df_model["hh_income_50k_100k"]
+        + df_model["hh_income_100k_plus"]
+    )
+
+    size_diff = (size_sum - df_model["total_households"]).abs()
+    income_diff = (income_sum - df_model["total_households"]).abs()
+
+    lines.append(f"Max |household-size sum - total_households|: {size_diff.max():,.0f}")
+    lines.append(f"Rows with household-size sum mismatch: {int((size_diff != 0).sum()):,}")
+    lines.append(f"Max |income sum - total_households|: {income_diff.max():,.0f}")
+    lines.append(f"Rows with income sum mismatch: {int((income_diff != 0).sum()):,}")
+
+    small_hh_threshold = 25
+    lines.append(f"Block groups with total_households = 0: {int((df_model['total_households'] == 0).sum()):,}")
+    lines.append(
+        f"Block groups with total_households below {small_hh_threshold}: "
+        f"{int((df_model['total_households'] < small_hh_threshold).sum()):,}"
+    )
+    lines.append("")
+
+    lines.append("Regression checks")
+    lines.append("-" * 80)
+    lines.append(f"R-squared: {result['r_squared']:.6f}")
+    lines.append(f"Adjusted R-squared: {result['adj_r_squared']:.6f}")
+    lines.append(f"RMSE: {result['rmse']:,.2f}")
+    lines.append(f"MAE: {result['mae']:,.2f}")
+    lines.append(f"Design matrix rank: {result['rank']:,}")
+    lines.append(f"Parameters: {result['n_params']:,}")
+
+    mape = _mean_absolute_percent_error(result["predictions"], result["y_col"])
+    lines.append(f"MAPE, excluding zero observed values: {mape:.6f}")
+
+    observed_predicted_corr = diagnostics[["observed_res_sqft", "predicted_total_res_sqft"]].corr().iloc[0, 1]
+    lines.append(f"Observed vs. predicted correlation: {observed_predicted_corr:.6f}")
+
+    residual = diagnostics["residual"]
+    abs_residual = diagnostics["abs_residual"]
+
+    lines.append("Residual distribution:")
+    lines.append(f"  Min residual: {residual.min():,.2f}")
+    lines.append(f"  25th percentile residual: {residual.quantile(0.25):,.2f}")
+    lines.append(f"  Median residual: {residual.median():,.2f}")
+    lines.append(f"  75th percentile residual: {residual.quantile(0.75):,.2f}")
+    lines.append(f"  Max residual: {residual.max():,.2f}")
+    lines.append(f"  Median absolute residual: {abs_residual.median():,.2f}")
+    lines.append(f"  95th percentile absolute residual: {abs_residual.quantile(0.95):,.2f}")
+
+    lines.extend(_step9_sign_check_lines(result))
+    lines.append("")
+
+    lines.append("Largest positive residuals, observed > predicted")
+    lines.append("-" * 80)
+    largest_positive = diagnostics.sort_values("residual", ascending=False).head(10)
+    for _, row in largest_positive.iterrows():
+        abs_pct_error = row["abs_pct_error"]
+        abs_pct_error_text = "NA" if pd.isna(abs_pct_error) else f"{abs_pct_error:.3f}"
+        lines.append(
+            f"{row['GEOID']}: observed={row['observed_res_sqft']:,.0f}, "
+            f"predicted={row['predicted_total_res_sqft']:,.0f}, "
+            f"residual={row['residual']:,.0f}, "
+            f"abs_pct_error={abs_pct_error_text}"
+        )
+
+    lines.append("")
+    lines.append("Largest negative residuals, observed < predicted")
+    lines.append("-" * 80)
+    largest_negative = diagnostics.sort_values("residual", ascending=True).head(10)
+    for _, row in largest_negative.iterrows():
+        abs_pct_error = row["abs_pct_error"]
+        abs_pct_error_text = "NA" if pd.isna(abs_pct_error) else f"{abs_pct_error:.3f}"
+        lines.append(
+            f"{row['GEOID']}: observed={row['observed_res_sqft']:,.0f}, "
+            f"predicted={row['predicted_total_res_sqft']:,.0f}, "
+            f"residual={row['residual']:,.0f}, "
+            f"abs_pct_error={abs_pct_error_text}"
+        )
+
+    lines.append("")
+    lines.append("Sensitivity check: dropping largest absolute residuals")
+    lines.append("-" * 80)
+
+    sensitivity_drop_n = min(10, len(df_reg))
+    outlier_geoids = diagnostics.head(sensitivity_drop_n)["GEOID"].tolist()
+    df_sensitivity = df_reg[~df_reg["GEOID"].isin(outlier_geoids)].copy()
+
+    if len(df_sensitivity) > result["n_params"]:
+        sensitivity_result = _fit_step9_model_b(df_sensitivity)
+        lines.append(f"Dropped largest absolute residual rows: {sensitivity_drop_n:,}")
+        lines.append(f"Original adjusted R-squared: {result['adj_r_squared']:.6f}")
+        lines.append(f"Sensitivity adjusted R-squared: {sensitivity_result['adj_r_squared']:.6f}")
+        lines.append(f"Original RMSE: {result['rmse']:,.2f}")
+        lines.append(f"Sensitivity RMSE: {sensitivity_result['rmse']:,.2f}")
+    else:
+        lines.append("WARN: Not enough rows for outlier-drop sensitivity check.")
+
+    lines.append("")
+    lines.append("Selected-model interpretation notes")
+    lines.append("-" * 80)
+    lines.append(
+        "Model B separates block-group scale from income composition: total_households "
+        "captures the number of households, while income shares capture mix relative "
+        "to the omitted $100k+ category."
+    )
+    lines.append(
+        "This model is slightly less rich than Model C but is simpler, easier to explain, "
+        "and avoids adding household-size share coefficients that provided only modest "
+        "additional fit in Step 8."
+    )
+
+    return lines
+
+
+# ---------------------------------------------------------------------
+# Step 9 runner
+# ---------------------------------------------------------------------
+
+def run_step_9_cobb() -> None:
+    """
+    Step 9:
+    Add Cobb QA/QC checks using selected Model B from Step 8.
+    """
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    df_model = _load_step6_cobb_modeling_table()
+    df_reg = _prepare_step8_modeling_data(df_model)
+
+    selected_model = _fit_step9_model_b(df_reg)
+    selected_model_name = selected_model["model_name"]
+
+    diagnostics = _build_step8_diagnostics(
+        df_model=df_reg,
+        result=selected_model,
+        diagnostic_model_label=selected_model_name,
+    )
+    diagnostics.to_csv(STEP9_COBB_DIAGNOSTICS_CSV, index=False)
+
+    qa_lines = _step9_qa_lines(
+        df_model=df_model,
+        df_reg=df_reg,
+        diagnostics=diagnostics,
+        result=selected_model,
+    )
+    save_qa_report(qa_lines, STEP9_COBB_QA_TXT)
+
+    print(f"Saved Step 9 QA report: {STEP9_COBB_QA_TXT}")
+    print(f"Saved Step 9 diagnostics: {STEP9_COBB_DIAGNOSTICS_CSV}")
 
 def _step8_report_lines(
     results: list[dict],
@@ -1771,9 +2092,12 @@ def run_step_8_cobb() -> None:
     print(f"Saved Step 8 diagnostics: {STEP8_COBB_DIAGNOSTICS_CSV}")
 
 
+
+
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -1809,13 +2133,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run Step 8 Cobb model specification comparison.",
     )
+    parser.add_argument(
+        "--step9-cobb",
+        action="store_true",
+        help="Run Step 9 Cobb QA/QC checks using selected Model B.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    # Default behavior: run Step 8 Cobb, auto-running earlier outputs if needed.
+    # Default behavior: run Step 9 Cobb, auto-running earlier outputs if needed.
     if (
         not args.step1_cobb
         and not args.step4_cobb
@@ -1823,8 +2152,9 @@ if __name__ == "__main__":
         and not args.step6_cobb
         and not args.step7_cobb
         and not args.step8_cobb
+        and not args.step9_cobb
     ):
-        run_step_8_cobb()
+        run_step_9_cobb()
     else:
         if args.step1_cobb:
             run_step_1_cobb()
@@ -1838,3 +2168,5 @@ if __name__ == "__main__":
             run_step_7_cobb()
         if args.step8_cobb:
             run_step_8_cobb()
+        if args.step9_cobb:
+            run_step_9_cobb()

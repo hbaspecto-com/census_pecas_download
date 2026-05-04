@@ -78,6 +78,11 @@ STEP6_COBB_QA_TXT = OUTPUT_DIR / "qa_step6_modeling_table_cobb_2024.txt"
 STEP7_COBB_RESULTS_TXT = OUTPUT_DIR / "regression_results_cobb.txt"
 STEP7_COBB_DIAGNOSTICS_CSV = OUTPUT_DIR / "regression_diagnostics_cobb.csv"
 
+# Step 8 outputs (Cobb model specification comparison)
+STEP8_COBB_MODEL_COMPARISON_CSV = OUTPUT_DIR / "regression_step8_model_comparison_cobb.csv"
+STEP8_COBB_RESULTS_TXT = OUTPUT_DIR / "regression_step8_results_cobb.txt"
+STEP8_COBB_DIAGNOSTICS_CSV = OUTPUT_DIR / "regression_step8_diagnostics_cobb.csv"
+
 # ---------------------------------------------------------------------
 # Geography helpers (Step 1)
 # ---------------------------------------------------------------------
@@ -1390,6 +1395,383 @@ def run_step_7_cobb() -> None:
 
 
 # ---------------------------------------------------------------------
+# Step 8 helpers
+# ---------------------------------------------------------------------
+
+def _prepare_step8_modeling_data(df_model: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prepare share and intensity variables for Step 8 specification testing.
+    """
+    df = df_model.copy()
+
+    df = df[df["total_households"] > 0].copy()
+
+    df["sqft_per_household"] = df["total_res_sqft"] / df["total_households"]
+
+    size_cols = [
+        "hh_size_1",
+        "hh_size_2",
+        "hh_size_3",
+        "hh_size_4",
+        "hh_size_5",
+        "hh_size_6plus",
+    ]
+
+    income_cols = [
+        "hh_income_lt_25k",
+        "hh_income_25k_50k",
+        "hh_income_50k_100k",
+        "hh_income_100k_plus",
+    ]
+
+    for col in size_cols:
+        share_col = col.replace("hh_size_", "share_size_")
+        df[share_col] = df[col] / df["total_households"]
+
+    income_share_names = {
+        "hh_income_lt_25k": "share_income_lt_25k",
+        "hh_income_25k_50k": "share_income_25k_50k",
+        "hh_income_50k_100k": "share_income_50k_100k",
+        "hh_income_100k_plus": "share_income_100k_plus",
+    }
+
+    for col, share_col in income_share_names.items():
+        df[share_col] = df[col] / df["total_households"]
+
+    return df
+
+
+def _mean_absolute_percent_error(prediction_df: pd.DataFrame, y_col: str) -> float:
+    """
+    Compute MAPE excluding rows where observed y is zero.
+    """
+    valid = prediction_df[y_col] != 0
+    if valid.sum() == 0:
+        return np.nan
+
+    return float(
+        np.mean(
+            np.abs(
+                prediction_df.loc[valid, "residual"]
+                / prediction_df.loc[valid, y_col]
+            )
+        )
+    )
+
+
+def _step8_model_comparison_rows(results: list[dict]) -> pd.DataFrame:
+    """
+    Build model comparison table for Step 8.
+    """
+    rows = []
+
+    for result in results:
+        mape = _mean_absolute_percent_error(
+            result["predictions"],
+            result["y_col"],
+        )
+
+        rows.append(
+            {
+                "model_name": result["model_name"],
+                "dependent_variable": result["y_col"],
+                "include_intercept": result["include_intercept"],
+                "n_obs": result["n_obs"],
+                "n_params": result["n_params"],
+                "rank": result["rank"],
+                "r_squared": result["r_squared"],
+                "adj_r_squared": result["adj_r_squared"],
+                "rmse": result["rmse"],
+                "mae": result["mae"],
+                "mape": mape,
+                "predictors": ", ".join(result["x_cols"]),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _build_step8_diagnostics(
+    df_model: pd.DataFrame,
+    result: dict,
+    diagnostic_model_label: str,
+) -> pd.DataFrame:
+    """
+    Build Step 8 diagnostics for one chosen model.
+
+    If the chosen model predicts sqft_per_household, also convert predictions
+    back to total residential square feet for residual review.
+    """
+    pred = result["predictions"].copy()
+
+    keep_cols = [
+        "GEOID",
+        "county_name",
+        "NAME",
+        "total_res_sqft",
+        "total_households",
+        "residential_record_count",
+        "sqft_per_household",
+        "share_size_1",
+        "share_size_2",
+        "share_size_3",
+        "share_size_4",
+        "share_size_5",
+        "share_size_6plus",
+        "share_income_lt_25k",
+        "share_income_25k_50k",
+        "share_income_50k_100k",
+        "share_income_100k_plus",
+    ]
+    keep_cols = [c for c in keep_cols if c in df_model.columns]
+
+    diag = pred.merge(
+        df_model[keep_cols],
+        on="GEOID",
+        how="left",
+        suffixes=("", "_model_table"),
+    )
+
+    diag["diagnostic_model"] = diagnostic_model_label
+
+    if result["y_col"] == "sqft_per_household":
+        diag = diag.rename(
+            columns={
+                "sqft_per_household": "observed_sqft_per_household",
+                "predicted_res_sqft": "predicted_sqft_per_household",
+            }
+        )
+        diag["predicted_total_res_sqft"] = (
+            diag["predicted_sqft_per_household"] * diag["total_households"]
+        )
+        diag["total_res_sqft_residual"] = (
+            diag["total_res_sqft"] - diag["predicted_total_res_sqft"]
+        )
+        diag["total_res_sqft_abs_residual"] = diag["total_res_sqft_residual"].abs()
+        diag["total_res_sqft_abs_pct_error"] = np.where(
+            diag["total_res_sqft"] != 0,
+            diag["total_res_sqft_abs_residual"] / diag["total_res_sqft"],
+            np.nan,
+        )
+
+        sort_col = "total_res_sqft_abs_residual"
+    else:
+        diag = diag.rename(
+            columns={
+                "total_res_sqft": "observed_res_sqft",
+                "predicted_res_sqft": "predicted_total_res_sqft",
+            }
+        )
+        sort_col = "abs_residual"
+
+    return diag.sort_values(sort_col, ascending=False).reset_index(drop=True)
+
+
+def _step8_report_lines(
+    results: list[dict],
+    comparison_df: pd.DataFrame,
+    diagnostics: pd.DataFrame,
+    diagnostic_model_name: str,
+) -> list[str]:
+    """
+    Build Step 8 text report.
+    """
+    lines = []
+
+    lines.append("Step 8 Model Specification Comparison - Cobb")
+    lines.append("=" * 80)
+    lines.append(f"ACS year: {ACS_YEAR}")
+    lines.append(f"Diagnostic model: {diagnostic_model_name}")
+    lines.append("")
+
+    lines.append("Model comparison:")
+    lines.append("-" * 80)
+    lines.append(
+        f"{'model_name':<48} "
+        f"{'dep_var':<22} "
+        f"{'adj_r2':>10} "
+        f"{'rmse':>14} "
+        f"{'mae':>14} "
+        f"{'mape':>10} "
+        f"{'rank':>6} "
+        f"{'params':>6}"
+    )
+
+    for _, row in comparison_df.iterrows():
+        lines.append(
+            f"{row['model_name']:<48} "
+            f"{row['dependent_variable']:<22} "
+            f"{row['adj_r_squared']:>10.6f} "
+            f"{row['rmse']:>14,.2f} "
+            f"{row['mae']:>14,.2f} "
+            f"{row['mape']:>10.4f} "
+            f"{int(row['rank']):>6} "
+            f"{int(row['n_params']):>6}"
+        )
+
+    lines.append("")
+    lines.append("Detailed model summaries:")
+    lines.append("=" * 80)
+    lines.append("")
+
+    for result in results:
+        lines.extend(_format_ols_summary(result))
+
+    lines.append("")
+    lines.append(f"Largest total-square-foot residuals from {diagnostic_model_name}:")
+    lines.append("-" * 80)
+
+    top = diagnostics.head(15)
+    for _, row in top.iterrows():
+        if "observed_res_sqft" in row:
+            observed = row["observed_res_sqft"]
+        else:
+            observed = row["total_res_sqft"]
+
+        predicted = row["predicted_total_res_sqft"]
+
+        if "total_res_sqft_residual" in row:
+            residual = row["total_res_sqft_residual"]
+            abs_pct_error = row["total_res_sqft_abs_pct_error"]
+        else:
+            residual = row["residual"]
+            abs_pct_error = row["abs_pct_error"]
+
+        abs_pct_error_text = "NA" if pd.isna(abs_pct_error) else f"{abs_pct_error:.3f}"
+
+        lines.append(
+            f"{row['GEOID']}: "
+            f"observed={observed:,.0f}, "
+            f"predicted={predicted:,.0f}, "
+            f"residual={residual:,.0f}, "
+            f"abs_pct_error={abs_pct_error_text}"
+        )
+
+    lines.append("")
+    lines.append("Initial interpretation notes:")
+    lines.append("-" * 80)
+    lines.append(
+        "Share-based models avoid the rank-deficiency problem caused by including "
+        "both complete household-size counts and complete income-count categories."
+    )
+    lines.append(
+        "Sqft-per-household models explain intensity rather than total scale; "
+        "their RMSE/MAE are in square feet per household, not total block-group square feet."
+    )
+    lines.append(
+        "For converting household forecasts to square-footage demand, prefer a model "
+        "with stable coefficients and clear total-square-foot prediction behavior."
+    )
+
+    return lines
+
+
+# ---------------------------------------------------------------------
+# Step 8 runner
+# ---------------------------------------------------------------------
+
+def run_step_8_cobb() -> None:
+    """
+    Step 8:
+    Compare candidate main modeling specifications for Cobb County.
+    """
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    df_model = _load_step6_cobb_modeling_table()
+    df_reg = _prepare_step8_modeling_data(df_model)
+
+    income_count_cols = [
+        "hh_income_lt_25k",
+        "hh_income_25k_50k",
+        "hh_income_50k_100k",
+        "hh_income_100k_plus",
+    ]
+
+    income_share_cols_reference_100k = [
+        "share_income_lt_25k",
+        "share_income_25k_50k",
+        "share_income_50k_100k",
+    ]
+
+    size_share_cols_reference_6plus = [
+        "share_size_1",
+        "share_size_2",
+        "share_size_3",
+        "share_size_4",
+        "share_size_5",
+    ]
+
+    model_a = _fit_ols(
+        df=df_reg,
+        y_col="total_res_sqft",
+        x_cols=income_count_cols,
+        model_name="A: Income Counts, No Intercept",
+        include_intercept=False,
+    )
+
+    model_b = _fit_ols(
+        df=df_reg,
+        y_col="total_res_sqft",
+        x_cols=["total_households"] + income_share_cols_reference_100k,
+        model_name="B: Total HH + Income Shares",
+        include_intercept=True,
+    )
+
+    model_c = _fit_ols(
+        df=df_reg,
+        y_col="total_res_sqft",
+        x_cols=["total_households"] + size_share_cols_reference_6plus + income_share_cols_reference_100k,
+        model_name="C: Total HH + Size Shares + Income Shares",
+        include_intercept=True,
+    )
+
+    model_d = _fit_ols(
+        df=df_reg,
+        y_col="sqft_per_household",
+        x_cols=income_share_cols_reference_100k,
+        model_name="D: SqFt per HH + Income Shares",
+        include_intercept=True,
+    )
+
+    model_e = _fit_ols(
+        df=df_reg,
+        y_col="sqft_per_household",
+        x_cols=size_share_cols_reference_6plus + income_share_cols_reference_100k,
+        model_name="E: SqFt per HH + Size Shares + Income Shares",
+        include_intercept=True,
+    )
+
+    results = [model_a, model_b, model_c, model_d, model_e]
+
+    comparison_df = _step8_model_comparison_rows(results)
+    comparison_df.to_csv(STEP8_COBB_MODEL_COMPARISON_CSV, index=False)
+
+    # Use Model C for diagnostics because it is the richest total-square-foot
+    # model that avoids complete category-sum redundancy.
+    diagnostic_model = model_c
+    diagnostic_model_name = diagnostic_model["model_name"]
+
+    diagnostics = _build_step8_diagnostics(
+        df_model=df_reg,
+        result=diagnostic_model,
+        diagnostic_model_label=diagnostic_model_name,
+    )
+    diagnostics.to_csv(STEP8_COBB_DIAGNOSTICS_CSV, index=False)
+
+    report_lines = _step8_report_lines(
+        results=results,
+        comparison_df=comparison_df,
+        diagnostics=diagnostics,
+        diagnostic_model_name=diagnostic_model_name,
+    )
+    save_qa_report(report_lines, STEP8_COBB_RESULTS_TXT)
+
+    print(f"Saved Step 8 model comparison: {STEP8_COBB_MODEL_COMPARISON_CSV}")
+    print(f"Saved Step 8 regression results: {STEP8_COBB_RESULTS_TXT}")
+    print(f"Saved Step 8 diagnostics: {STEP8_COBB_DIAGNOSTICS_CSV}")
+
+
+# ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
 
@@ -1422,21 +1804,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run Step 7 Cobb initial sanity-check regressions.",
     )
+    parser.add_argument(
+        "--step8-cobb",
+        action="store_true",
+        help="Run Step 8 Cobb model specification comparison.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    # Default behavior: run Step 7 Cobb, auto-running earlier outputs if needed.
+    # Default behavior: run Step 8 Cobb, auto-running earlier outputs if needed.
     if (
         not args.step1_cobb
         and not args.step4_cobb
         and not args.step5_cobb
         and not args.step6_cobb
         and not args.step7_cobb
+        and not args.step8_cobb
     ):
-        run_step_7_cobb()
+        run_step_8_cobb()
     else:
         if args.step1_cobb:
             run_step_1_cobb()
@@ -1448,3 +1836,5 @@ if __name__ == "__main__":
             run_step_6_cobb()
         if args.step7_cobb:
             run_step_7_cobb()
+        if args.step8_cobb:
+            run_step_8_cobb()

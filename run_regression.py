@@ -11,6 +11,7 @@ Implemented:
 - Step 5: Prepare ACS household predictors
 - Step 6: Join parcel-derived dependent variable to ACS predictors
 - Step 10: Build 4x6 income-by-size household category predictors (I1H1..I4H6)
+- Step 11: Marginal size (H1..H6) + income modifiers (dI1, dI3, dI4 vs I2 baseline), 9 coefficients, no intercept
 """
 
 from pathlib import Path
@@ -94,6 +95,20 @@ STEP10_COBB_MODELING_TABLE_CSV = OUTPUT_DIR / "regression_modeling_table_4x6_cob
 STEP10_COBB_QA_TXT = OUTPUT_DIR / "qa_step10_4x6_cobb_2024.txt"
 STEP10_COBB_RESULTS_TXT = OUTPUT_DIR / "regression_step10_results_cobb.txt"
 STEP10_COBB_DIAGNOSTICS_CSV = OUTPUT_DIR / "regression_step10_diagnostics_cobb.csv"
+
+# Step 11 outputs (Cobb marginal income + size model: 9 coefficients, no intercept, I2 fixed to 0)
+STEP11_COBB_MODELING_TABLE_CSV = OUTPUT_DIR / "regression_modeling_table_step11_cobb_bg.csv"
+STEP11_COBB_RESULTS_TXT = OUTPUT_DIR / "regression_step11_results_cobb.txt"
+STEP11_COBB_DIAGNOSTICS_CSV = OUTPUT_DIR / "regression_step11_diagnostics_cobb.csv"
+
+# Marginal predictor column names for Step 11
+INCOME_MARGINAL_COLS = ["I1", "I2", "I3", "I4"]
+SIZE_MARGINAL_COLS = ["H1", "H2", "H3", "H4", "H5", "H6"]
+# Step 11 uses H1..H6 (size coefficients for I2 baseline) + dI1, dI3, dI4 (income modifiers vs I2).
+# I2 coefficient is fixed to 0; income modifier columns are derived as Ix - I2.
+STEP11_PREDICTOR_COLS = INCOME_MARGINAL_COLS + SIZE_MARGINAL_COLS
+STEP11_INCOME_MODIFIER_COLS = ["dI1", "dI3", "dI4"]  # derived: Ix - I2
+STEP11_FINAL_PREDICTOR_COLS = SIZE_MARGINAL_COLS + STEP11_INCOME_MODIFIER_COLS
 
 # Income group boundaries (in dollars) for the 4x6 ARC household categories.
 # These define the lower bound of each group (except group 1 which starts at 0).
@@ -2290,13 +2305,15 @@ def _build_step10_4x6_predictors() -> pd.DataFrame:
         ["GEOID", "state", "county", "tract", "block group", "county_name"]
     ]
 
+    marginal_cols = INCOME_GROUP_LABELS + list(ACS_B25009_SIZE_COLS.keys())
+
     out = df_cobb_bg.merge(
-        df[["GEOID", "total_households"] + cross_cols],
+        df[["GEOID", "total_households"] + marginal_cols + cross_cols],
         on="GEOID",
         how="left",
     )
 
-    for col in ["total_households"] + cross_cols:
+    for col in ["total_households"] + marginal_cols + cross_cols:
         out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).round(0).astype(int)
 
     return out.sort_values("GEOID").reset_index(drop=True)
@@ -2530,6 +2547,182 @@ def run_step_10_cobb() -> None:
 
 
 # ---------------------------------------------------------------------
+# Step 11 helpers
+# ---------------------------------------------------------------------
+
+def _build_step11_modeling_table(df_4x6: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build the Step 11 modeling table from the Step 10 4x6 predictor table.
+
+    The marginal income columns (I1..I4) and size columns (H1..H6) are already
+    present in df_4x6 as intermediate columns computed during Step 10.  We just
+    need to join the parcel-derived square footage and keep the 10 marginal cols.
+    """
+    df_sqft = _load_step4_cobb_res_sqft()
+
+    sqft_cols = [
+        "GEOID",
+        "total_res_sqft",
+        "residential_record_count",
+        "zero_res_sqft_record_count",
+        "missing_res_sqft_record_count",
+    ]
+    sqft_cols = [c for c in sqft_cols if c in df_sqft.columns]
+
+    out = df_4x6.merge(df_sqft[sqft_cols], on="GEOID", how="left", indicator=True)
+    out["parcel_join_status"] = out["_merge"].map(
+        {"both": "matched", "left_only": "missing_parcel_sqft"}
+    )
+    out = out.drop(columns=["_merge"])
+
+    for col in ["total_res_sqft", "residential_record_count",
+                "zero_res_sqft_record_count", "missing_res_sqft_record_count"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).round(0).astype("int64")
+
+    preferred_order = (
+        ["GEOID", "state", "county", "county_name", "tract", "block group",
+         "total_res_sqft", "residential_record_count", "parcel_join_status",
+         "total_households"]
+        + STEP11_PREDICTOR_COLS
+    )
+    ordered = [c for c in preferred_order if c in out.columns]
+    remaining = [c for c in out.columns if c not in ordered]
+    return out[ordered + remaining].sort_values("GEOID").reset_index(drop=True)
+
+
+def _fit_step11_model(df_reg: pd.DataFrame) -> dict:
+    """
+    Fit the Step 11 marginal model with I2 fixed to 0:
+      total_res_sqft ~ H1 + H2 + H3 + H4 + H5 + H6 + dI1 + dI3 + dI4
+      (no intercept, 9 predictors)
+
+    H1..H6 coefficients represent sqft per household of each size for the I2
+    (middle-low income) baseline.  dI1 = I1 - I2, dI3 = I3 - I2, dI4 = I4 - I2
+    are income modifier columns; their coefficients are the sqft adjustment
+    relative to an I2 household of the same size.  I2's coefficient is
+    implicitly 0 by construction.
+    """
+    df = df_reg.copy()
+    df["dI1"] = df["I1"] - df["I2"]
+    df["dI3"] = df["I3"] - df["I2"]
+    df["dI4"] = df["I4"] - df["I2"]
+    return _fit_ols(
+        df=df,
+        y_col="total_res_sqft",
+        x_cols=STEP11_FINAL_PREDICTOR_COLS,
+        model_name="Step 11: Marginal Income+Size (I2=0 baseline, 9 predictors)",
+        include_intercept=False,
+    )
+
+
+def _step11_report_lines(result: dict, diagnostics: pd.DataFrame) -> list[str]:
+    """
+    Build the Step 11 regression results report.
+    """
+    lines = []
+    lines.append("Step 11 Regression Results - Cobb Marginal Income + Size Model")
+    lines.append("=" * 80)
+    lines.append(f"ACS year: {ACS_YEAR}")
+    lines.append(
+        "Model: total_res_sqft ~ H1 + H2 + H3 + H4 + H5 + H6 + dI1 + dI3 + dI4"
+        " (no intercept, 9 predictors, I2 fixed to 0)"
+    )
+    lines.append(
+        "Income groups: I1=[0,27k), I2=[27k,65k) [baseline, coef=0], "
+        "I3=[65k,130k), I4=[130k+)"
+    )
+    lines.append(
+        "Size groups: H1=1 person, H2=2, H3=3, H4=4, H5=5, H6=6+"
+    )
+    lines.append(
+        "H coefficients = sqft per I2 household of each size. "
+        "dI1/dI3/dI4 = income modifiers relative to I2 (dIx = Ix - I2)."
+    )
+    lines.append(
+        "Marginals derived from ACS B19001 (income) and B25009 (size by tenure)."
+    )
+    lines.append("")
+
+    lines.extend(_format_ols_summary(result))
+
+    mape = _mean_absolute_percent_error(result["predictions"], result["y_col"])
+    lines.append(f"MAPE (excluding zero observed): {mape:.6f}")
+
+    obs_pred_corr = (
+        diagnostics[["observed_res_sqft", "predicted_total_res_sqft"]]
+        .corr()
+        .iloc[0, 1]
+    )
+    lines.append(f"Observed vs. predicted correlation: {obs_pred_corr:.6f}")
+    lines.append("")
+
+    lines.append("Largest positive residuals (observed > predicted):")
+    lines.append("-" * 80)
+    for _, row in diagnostics.sort_values("residual", ascending=False).head(10).iterrows():
+        ape = row["abs_pct_error"]
+        ape_txt = "NA" if pd.isna(ape) else f"{ape:.3f}"
+        lines.append(
+            f"{row['GEOID']}: observed={row['observed_res_sqft']:,.0f}, "
+            f"predicted={row['predicted_total_res_sqft']:,.0f}, "
+            f"residual={row['residual']:,.0f}, abs_pct_error={ape_txt}"
+        )
+
+    lines.append("")
+    lines.append("Largest negative residuals (observed < predicted):")
+    lines.append("-" * 80)
+    for _, row in diagnostics.sort_values("residual", ascending=True).head(10).iterrows():
+        ape = row["abs_pct_error"]
+        ape_txt = "NA" if pd.isna(ape) else f"{ape:.3f}"
+        lines.append(
+            f"{row['GEOID']}: observed={row['observed_res_sqft']:,.0f}, "
+            f"predicted={row['predicted_total_res_sqft']:,.0f}, "
+            f"residual={row['residual']:,.0f}, abs_pct_error={ape_txt}"
+        )
+
+    lines.append("")
+    return lines
+
+
+# ---------------------------------------------------------------------
+# Step 11 runner
+# ---------------------------------------------------------------------
+
+def run_step_11_cobb() -> None:
+    """
+    Step 11:
+    Fit a 9-coefficient marginal model (6 size + 3 income modifiers, no intercept,
+    I2 fixed to 0) for Cobb County using the marginal household counts computed
+    in Step 10.  H coefficients are sqft per I2-baseline household of each size;
+    dI1/dI3/dI4 are income adjustments relative to I2.
+    """
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    print("Building Step 10 4x6 predictors (needed for marginals)...")
+    df_4x6 = _build_step10_4x6_predictors()
+
+    df_model = _build_step11_modeling_table(df_4x6)
+    df_model.to_csv(STEP11_COBB_MODELING_TABLE_CSV, index=False)
+    print(f"Saved Step 11 modeling table: {STEP11_COBB_MODELING_TABLE_CSV}")
+
+    df_reg = df_model[df_model["total_households"] > 0].copy()
+
+    result = _fit_step11_model(df_reg)
+
+    diagnostics = _build_step8_diagnostics(
+        df_model=df_reg,
+        result=result,
+        diagnostic_model_label=result["model_name"],
+    )
+    diagnostics.to_csv(STEP11_COBB_DIAGNOSTICS_CSV, index=False)
+    print(f"Saved Step 11 diagnostics: {STEP11_COBB_DIAGNOSTICS_CSV}")
+
+    report_lines = _step11_report_lines(result, diagnostics)
+    save_qa_report(report_lines, STEP11_COBB_RESULTS_TXT)
+    print(f"Saved Step 11 regression results: {STEP11_COBB_RESULTS_TXT}")
+
+
+# ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
 
@@ -2578,6 +2771,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run Step 10 Cobb 4x6 income-by-size household category regression.",
     )
+    parser.add_argument(
+        "--step11-cobb",
+        action="store_true",
+        help="Run Step 11 Cobb marginal income+size model (10 coefficients, no intercept).",
+    )
     return parser.parse_args()
 
 
@@ -2594,6 +2792,7 @@ if __name__ == "__main__":
         and not args.step8_cobb
         and not args.step9_cobb
         and not args.step10_cobb
+        and not args.step11_cobb
     ):
         run_step_9_cobb()
     else:
@@ -2613,3 +2812,5 @@ if __name__ == "__main__":
             run_step_9_cobb()
         if args.step10_cobb:
             run_step_10_cobb()
+        if args.step11_cobb:
+            run_step_11_cobb()

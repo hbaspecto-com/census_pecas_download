@@ -9,10 +9,12 @@ Implemented:
 - Step 1: Define initial geography (Cobb block groups)
 - Step 4: Aggregate residential square footage by block group
 - Step 5: Prepare ACS household predictors
+- Step 6: Join parcel-derived dependent variable to ACS predictors
 """
 
 from pathlib import Path
 import argparse
+import numpy as np
 import pandas as pd
 import requests
 
@@ -68,6 +70,13 @@ STEP4_COBB_UNMATCHED_CSV = OUTPUT_DIR / "regression_unmatched_parcels_cobb_2024.
 STEP5_COBB_ACS_PREDICTORS_CSV = OUTPUT_DIR / "regression_acs_predictors_cobb_2024.csv"
 STEP5_COBB_QA_TXT = OUTPUT_DIR / "qa_step5_acs_cobb_2024.txt"
 
+# Step 6 outputs (Cobb modeling table)
+STEP6_COBB_MODELING_TABLE_CSV = OUTPUT_DIR / "regression_modeling_table_cobb_bg.csv"
+STEP6_COBB_QA_TXT = OUTPUT_DIR / "qa_step6_modeling_table_cobb_2024.txt"
+
+# Step 7 outputs (Cobb regressions)
+STEP7_COBB_RESULTS_TXT = OUTPUT_DIR / "regression_results_cobb.txt"
+STEP7_COBB_DIAGNOSTICS_CSV = OUTPUT_DIR / "regression_diagnostics_cobb.csv"
 
 # ---------------------------------------------------------------------
 # Geography helpers (Step 1)
@@ -729,6 +738,658 @@ def run_step_5_cobb() -> None:
 
 
 # ---------------------------------------------------------------------
+# Step 6 helpers
+# ---------------------------------------------------------------------
+
+def _load_step4_cobb_res_sqft() -> pd.DataFrame:
+    """
+    Load Step 4 Cobb residential square-footage table.
+    If missing, run Step 4 first.
+    """
+    if not STEP4_COBB_BG_RES_SQFT_CSV.exists():
+        print("Step 4 output not found. Running Step 4 automatically...")
+        run_step_4_cobb()
+
+    df = pd.read_csv(STEP4_COBB_BG_RES_SQFT_CSV, dtype={"GEOID": str})
+    df["GEOID"] = _normalize_geoid(df["GEOID"])
+
+    numeric_cols = [
+        "residential_record_count",
+        "total_res_sqft",
+        "zero_res_sqft_record_count",
+        "missing_res_sqft_record_count",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
+def _load_step5_cobb_acs_predictors() -> pd.DataFrame:
+    """
+    Load Step 5 Cobb ACS predictor table.
+    If missing, run Step 5 first.
+    """
+    if not STEP5_COBB_ACS_PREDICTORS_CSV.exists():
+        print("Step 5 output not found. Running Step 5 automatically...")
+        run_step_5_cobb()
+
+    df = pd.read_csv(STEP5_COBB_ACS_PREDICTORS_CSV, dtype={"GEOID": str})
+    df["GEOID"] = _normalize_geoid(df["GEOID"])
+
+    predictor_cols = [
+        "total_households",
+        "hh_size_1",
+        "hh_size_2",
+        "hh_size_3",
+        "hh_size_4",
+        "hh_size_5",
+        "hh_size_6plus",
+        "hh_income_lt_25k",
+        "hh_income_25k_50k",
+        "hh_income_50k_100k",
+        "hh_income_100k_plus",
+    ]
+    for col in predictor_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
+def _build_step6_modeling_table() -> pd.DataFrame:
+    """
+    Join Step 4 parcel-derived dependent variable to Step 5 ACS predictors.
+
+    Output should have one row per Cobb block group.
+    """
+    df_sqft = _load_step4_cobb_res_sqft()
+    df_acs = _load_step5_cobb_acs_predictors()
+
+    if df_sqft["GEOID"].duplicated().any():
+        duplicated = df_sqft.loc[df_sqft["GEOID"].duplicated(keep=False), "GEOID"].tolist()
+        raise ValueError(f"Step 4 table has duplicate GEOIDs. First duplicates: {duplicated[:10]}")
+
+    if df_acs["GEOID"].duplicated().any():
+        duplicated = df_acs.loc[df_acs["GEOID"].duplicated(keep=False), "GEOID"].tolist()
+        raise ValueError(f"Step 5 table has duplicate GEOIDs. First duplicates: {duplicated[:10]}")
+
+    sqft_cols = [
+        "GEOID",
+        "total_res_sqft",
+        "residential_record_count",
+        "zero_res_sqft_record_count",
+        "missing_res_sqft_record_count",
+    ]
+    sqft_cols = [c for c in sqft_cols if c in df_sqft.columns]
+
+    acs_cols = [
+        "GEOID",
+        "state",
+        "county",
+        "county_name",
+        "tract",
+        "block group",
+        "NAME",
+        "total_households",
+        "hh_size_1",
+        "hh_size_2",
+        "hh_size_3",
+        "hh_size_4",
+        "hh_size_5",
+        "hh_size_6plus",
+        "hh_income_lt_25k",
+        "hh_income_25k_50k",
+        "hh_income_50k_100k",
+        "hh_income_100k_plus",
+    ]
+    acs_cols = [c for c in acs_cols if c in df_acs.columns]
+
+    out = df_acs[acs_cols].merge(
+        df_sqft[sqft_cols],
+        on="GEOID",
+        how="left",
+        indicator=True,
+    )
+
+    out["parcel_join_status"] = out["_merge"].map(
+        {
+            "both": "matched",
+            "left_only": "missing_parcel_sqft",
+            "right_only": "unexpected_right_only",
+        }
+    )
+    out = out.drop(columns=["_merge"])
+
+    parcel_numeric_cols = [
+        "total_res_sqft",
+        "residential_record_count",
+        "zero_res_sqft_record_count",
+        "missing_res_sqft_record_count",
+    ]
+    for col in parcel_numeric_cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).round(0).astype("int64")
+
+    predictor_cols = [
+        "total_households",
+        "hh_size_1",
+        "hh_size_2",
+        "hh_size_3",
+        "hh_size_4",
+        "hh_size_5",
+        "hh_size_6plus",
+        "hh_income_lt_25k",
+        "hh_income_25k_50k",
+        "hh_income_50k_100k",
+        "hh_income_100k_plus",
+    ]
+    for col in predictor_cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    if "county" in out.columns:
+        out["county"] = out["county"].astype(str).str.zfill(3)
+
+    out = out.sort_values("GEOID").reset_index(drop=True)
+
+    preferred_order = [
+        "GEOID",
+        "state",
+        "county",
+        "county_name",
+        "tract",
+        "block group",
+        "NAME",
+        "total_res_sqft",
+        "residential_record_count",
+        "zero_res_sqft_record_count",
+        "missing_res_sqft_record_count",
+        "parcel_join_status",
+        "total_households",
+        "hh_size_1",
+        "hh_size_2",
+        "hh_size_3",
+        "hh_size_4",
+        "hh_size_5",
+        "hh_size_6plus",
+        "hh_income_lt_25k",
+        "hh_income_25k_50k",
+        "hh_income_50k_100k",
+        "hh_income_100k_plus",
+    ]
+    ordered_cols = [c for c in preferred_order if c in out.columns]
+    remaining_cols = [c for c in out.columns if c not in ordered_cols]
+
+    return out[ordered_cols + remaining_cols]
+
+
+def _step6_qa_lines(df_model: pd.DataFrame, df_sqft: pd.DataFrame, df_acs: pd.DataFrame) -> list[str]:
+    """
+    Build a text QA report for Step 6.
+    """
+    lines = []
+    lines.append("Step 6 QA Report - Cobb Modeling Table")
+    lines.append("=" * 80)
+    lines.append(f"Step 4 parcel/BG rows: {len(df_sqft):,}")
+    lines.append(f"Step 5 ACS predictor rows: {len(df_acs):,}")
+    lines.append(f"Modeling table rows: {len(df_model):,}")
+    lines.append("")
+
+    lines.append("GEOID checks:")
+    bad_geoid_len = df_model[df_model["GEOID"].astype(str).str.len() != 12]
+    bad_geoid_prefix = df_model[~df_model["GEOID"].astype(str).str.startswith("13067")]
+    duplicated_geoids = df_model[df_model["GEOID"].duplicated(keep=False)]
+
+    lines.append(
+        "PASS: All modeling-table GEOIDs are 12 characters."
+        if bad_geoid_len.empty else f"FAIL: {len(bad_geoid_len):,} rows have bad GEOID length."
+    )
+    lines.append(
+        "PASS: All modeling-table GEOIDs start with 13067."
+        if bad_geoid_prefix.empty else f"FAIL: {len(bad_geoid_prefix):,} rows do not start with 13067."
+    )
+    lines.append(
+        "PASS: Modeling table has one row per GEOID."
+        if duplicated_geoids.empty else f"FAIL: {len(duplicated_geoids):,} duplicate GEOID rows found."
+    )
+    lines.append("")
+
+    lines.append("Join checks:")
+    if "parcel_join_status" in df_model.columns:
+        status_counts = df_model["parcel_join_status"].value_counts(dropna=False).sort_index()
+        for status, count in status_counts.items():
+            lines.append(f"  {status}: {count:,}")
+    lines.append("")
+
+    predictor_cols = [
+        "total_households",
+        "hh_size_1",
+        "hh_size_2",
+        "hh_size_3",
+        "hh_size_4",
+        "hh_size_5",
+        "hh_size_6plus",
+        "hh_income_lt_25k",
+        "hh_income_25k_50k",
+        "hh_income_50k_100k",
+        "hh_income_100k_plus",
+    ]
+
+    parcel_cols = [
+        "total_res_sqft",
+        "residential_record_count",
+        "zero_res_sqft_record_count",
+        "missing_res_sqft_record_count",
+    ]
+
+    lines.append("Missing-value checks:")
+    for col in parcel_cols + predictor_cols:
+        if col in df_model.columns:
+            missing_count = int(df_model[col].isna().sum())
+            lines.append(f"  {col}: {missing_count:,} missing")
+    lines.append("")
+
+    if "total_households" in df_model.columns:
+        zero_hh = int((df_model["total_households"] == 0).sum())
+        lines.append(f"Rows with total_households = 0: {zero_hh:,}")
+
+    if "total_res_sqft" in df_model.columns:
+        zero_sqft = int((df_model["total_res_sqft"] == 0).sum())
+        total_sqft = int(df_model["total_res_sqft"].sum())
+        lines.append(f"Rows with total_res_sqft = 0: {zero_sqft:,}")
+        lines.append(f"Total residential sqft in modeling table: {total_sqft:,}")
+
+    lines.append("")
+
+    if {"total_res_sqft", "total_households"}.issubset(df_model.columns):
+        valid_ratio = df_model["total_households"] > 0
+        sqft_per_hh = df_model.loc[valid_ratio, "total_res_sqft"] / df_model.loc[valid_ratio, "total_households"]
+        lines.append("Sqft per household sanity summary, excluding zero-household BGs:")
+        lines.append(f"  Count: {len(sqft_per_hh):,}")
+        lines.append(f"  Min: {sqft_per_hh.min():,.2f}")
+        lines.append(f"  Median: {sqft_per_hh.median():,.2f}")
+        lines.append(f"  Mean: {sqft_per_hh.mean():,.2f}")
+        lines.append(f"  Max: {sqft_per_hh.max():,.2f}")
+        lines.append("")
+
+    if {"GEOID", "total_res_sqft", "total_households"}.issubset(df_model.columns):
+        top10 = df_model.nlargest(10, "total_res_sqft")[["GEOID", "total_res_sqft", "total_households"]]
+        lines.append("Top 10 block groups by total_res_sqft:")
+        for _, row in top10.iterrows():
+            lines.append(
+                f"  {row['GEOID']}: total_res_sqft={int(row['total_res_sqft']):,}, "
+                f"total_households={int(row['total_households']):,}"
+            )
+
+    return lines
+
+
+# ---------------------------------------------------------------------
+# Step 6 runner
+# ---------------------------------------------------------------------
+
+def run_step_6_cobb() -> None:
+    """
+    Step 6:
+    Join parcel-derived dependent variable to ACS predictors for Cobb County.
+    """
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    df_sqft = _load_step4_cobb_res_sqft()
+    df_acs = _load_step5_cobb_acs_predictors()
+    df_model = _build_step6_modeling_table()
+
+    df_model.to_csv(STEP6_COBB_MODELING_TABLE_CSV, index=False)
+
+    qa_lines = _step6_qa_lines(df_model, df_sqft, df_acs)
+    save_qa_report(qa_lines, STEP6_COBB_QA_TXT)
+
+    print(f"Saved Step 6 modeling table: {STEP6_COBB_MODELING_TABLE_CSV}")
+    print(f"Saved Step 6 QA report: {STEP6_COBB_QA_TXT}")
+
+
+# ---------------------------------------------------------------------
+# Step 7 helpers
+# ---------------------------------------------------------------------
+
+def _load_step6_cobb_modeling_table() -> pd.DataFrame:
+    """
+    Load Step 6 Cobb modeling table.
+    If missing, run Step 6 first.
+    """
+    if not STEP6_COBB_MODELING_TABLE_CSV.exists():
+        print("Step 6 output not found. Running Step 6 automatically...")
+        run_step_6_cobb()
+
+    df = pd.read_csv(STEP6_COBB_MODELING_TABLE_CSV, dtype={"GEOID": str})
+    df["GEOID"] = _normalize_geoid(df["GEOID"])
+
+    numeric_cols = [
+        "total_res_sqft",
+        "residential_record_count",
+        "zero_res_sqft_record_count",
+        "missing_res_sqft_record_count",
+        "total_households",
+        "hh_size_1",
+        "hh_size_2",
+        "hh_size_3",
+        "hh_size_4",
+        "hh_size_5",
+        "hh_size_6plus",
+        "hh_income_lt_25k",
+        "hh_income_25k_50k",
+        "hh_income_50k_100k",
+        "hh_income_100k_plus",
+    ]
+
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
+def _fit_ols(
+    df: pd.DataFrame,
+    y_col: str,
+    x_cols: list[str],
+    model_name: str,
+    include_intercept: bool = True,
+) -> dict:
+    """
+    Fit OLS with numpy and return summary statistics plus predictions.
+
+    This intentionally avoids adding a statsmodels dependency for the first
+    sanity-check pass.
+    """
+    needed_cols = [y_col] + x_cols
+    model_df = df.dropna(subset=needed_cols).copy()
+
+    y = model_df[y_col].to_numpy(dtype=float)
+    x = model_df[x_cols].to_numpy(dtype=float)
+
+    if include_intercept:
+        x_design = np.column_stack([np.ones(len(model_df)), x])
+        coefficient_names = ["intercept"] + x_cols
+    else:
+        x_design = x
+        coefficient_names = x_cols
+
+    coefficients, residual_sum_squares_raw, rank, singular_values = np.linalg.lstsq(
+        x_design,
+        y,
+        rcond=None,
+    )
+
+    predicted = x_design @ coefficients
+    residual = y - predicted
+
+    n_obs = len(y)
+    n_params = x_design.shape[1]
+
+    sse = float(np.sum(residual ** 2))
+    tss = float(np.sum((y - y.mean()) ** 2))
+    r_squared = 1 - (sse / tss) if tss != 0 else np.nan
+
+    if n_obs > n_params and tss != 0:
+        adj_r_squared = 1 - ((sse / (n_obs - n_params)) / (tss / (n_obs - 1)))
+    else:
+        adj_r_squared = np.nan
+
+    rmse = float(np.sqrt(sse / n_obs)) if n_obs > 0 else np.nan
+    mae = float(np.mean(np.abs(residual))) if n_obs > 0 else np.nan
+
+    if n_obs > n_params:
+        sigma2 = sse / (n_obs - n_params)
+        xtx_inv = np.linalg.pinv(x_design.T @ x_design)
+        standard_errors = np.sqrt(np.diag(sigma2 * xtx_inv))
+    else:
+        standard_errors = np.full(len(coefficients), np.nan)
+
+    coef_df = pd.DataFrame(
+        {
+            "term": coefficient_names,
+            "coefficient": coefficients,
+            "std_error": standard_errors,
+        }
+    )
+
+    prediction_df = model_df[["GEOID", y_col]].copy()
+    prediction_df["predicted_res_sqft"] = predicted
+    prediction_df["residual"] = residual
+    prediction_df["abs_residual"] = np.abs(residual)
+    prediction_df["abs_pct_error"] = np.where(
+        prediction_df[y_col] != 0,
+        prediction_df["abs_residual"] / prediction_df[y_col],
+        np.nan,
+    )
+
+    return {
+        "model_name": model_name,
+        "include_intercept": include_intercept,
+        "y_col": y_col,
+        "x_cols": x_cols,
+        "n_obs": n_obs,
+        "n_params": n_params,
+        "rank": int(rank),
+        "r_squared": r_squared,
+        "adj_r_squared": adj_r_squared,
+        "rmse": rmse,
+        "mae": mae,
+        "coefficients": coef_df,
+        "predictions": prediction_df,
+    }
+
+
+def _format_ols_summary(result: dict) -> list[str]:
+    """
+    Format one OLS result as text report lines.
+    """
+    lines = []
+
+    lines.append(result["model_name"])
+    lines.append("-" * 80)
+    lines.append(f"Dependent variable: {result['y_col']}")
+    lines.append(f"Predictors: {', '.join(result['x_cols'])}")
+    lines.append(f"Includes intercept: {result['include_intercept']}")
+    lines.append(f"Observations: {result['n_obs']:,}")
+    lines.append(f"Parameters: {result['n_params']:,}")
+    lines.append(f"Design matrix rank: {result['rank']:,}")
+    lines.append(f"R-squared: {result['r_squared']:.6f}")
+    lines.append(f"Adjusted R-squared: {result['adj_r_squared']:.6f}")
+    lines.append(f"RMSE: {result['rmse']:,.2f}")
+    lines.append(f"MAE: {result['mae']:,.2f}")
+    lines.append("")
+    lines.append("Coefficients:")
+    lines.append(f"{'term':<28} {'coefficient':>18} {'std_error':>18}")
+
+    for _, row in result["coefficients"].iterrows():
+        lines.append(
+            f"{row['term']:<28} "
+            f"{row['coefficient']:>18,.6f} "
+            f"{row['std_error']:>18,.6f}"
+        )
+
+    lines.append("")
+
+    return lines
+
+
+def _build_step7_diagnostics(
+    df_model: pd.DataFrame,
+    combined_result: dict,
+) -> pd.DataFrame:
+    """
+    Build block-group diagnostics from the combined first-pass model.
+    """
+    diag = combined_result["predictions"].copy()
+
+    keep_cols = [
+        "GEOID",
+        "county_name",
+        "NAME",
+        "total_households",
+        "residential_record_count",
+        "hh_size_1",
+        "hh_size_2",
+        "hh_size_3",
+        "hh_size_4",
+        "hh_size_5",
+        "hh_size_6plus",
+        "hh_income_lt_25k",
+        "hh_income_25k_50k",
+        "hh_income_50k_100k",
+        "hh_income_100k_plus",
+    ]
+    keep_cols = [c for c in keep_cols if c in df_model.columns]
+
+    diag = diag.merge(
+        df_model[keep_cols],
+        on="GEOID",
+        how="left",
+    )
+
+    diag = diag.rename(columns={"total_res_sqft": "observed_res_sqft"})
+
+    ordered_cols = [
+        "GEOID",
+        "county_name",
+        "NAME",
+        "observed_res_sqft",
+        "predicted_res_sqft",
+        "residual",
+        "abs_residual",
+        "abs_pct_error",
+        "total_households",
+        "residential_record_count",
+    ]
+    ordered_cols = [c for c in ordered_cols if c in diag.columns]
+    remaining_cols = [c for c in diag.columns if c not in ordered_cols]
+
+    return diag[ordered_cols + remaining_cols].sort_values(
+        "abs_residual",
+        ascending=False,
+    ).reset_index(drop=True)
+
+
+def _step7_report_lines(results: list[dict], diagnostics: pd.DataFrame) -> list[str]:
+    """
+    Build Step 7 regression results report.
+    """
+    lines = []
+
+    lines.append("Step 7 Regression Results - Cobb Initial Sanity-Check Models")
+    lines.append("=" * 80)
+    lines.append(f"ACS year: {ACS_YEAR}")
+    lines.append(f"Diagnostics model: Combined first-pass model")
+    lines.append("")
+
+    for result in results:
+        lines.extend(_format_ols_summary(result))
+
+    lines.append("Largest absolute residuals from combined first-pass model:")
+    lines.append("-" * 80)
+
+    top = diagnostics.head(15)
+    for _, row in top.iterrows():
+        abs_pct_error = row["abs_pct_error"]
+        abs_pct_error_text = "NA" if pd.isna(abs_pct_error) else f"{abs_pct_error:.3f}"
+
+        lines.append(
+            f"{row['GEOID']}: "
+            f"observed={row['observed_res_sqft']:,.0f}, "
+            f"predicted={row['predicted_res_sqft']:,.0f}, "
+            f"residual={row['residual']:,.0f}, "
+            f"abs_pct_error={abs_pct_error_text}"
+        )
+
+    lines.append("")
+
+    return lines
+
+
+# ---------------------------------------------------------------------
+# Step 7 runner
+# ---------------------------------------------------------------------
+
+def run_step_7_cobb() -> None:
+    """
+    Step 7:
+    Run initial Cobb sanity-check OLS regressions.
+    """
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    df_model = _load_step6_cobb_modeling_table()
+
+    # For the first pass, exclude rows with zero households because the ACS
+    # household predictors cannot explain residential square footage there.
+    df_reg = df_model[df_model["total_households"] > 0].copy()
+
+    y_col = "total_res_sqft"
+
+    size_cols = [
+        "hh_size_1",
+        "hh_size_2",
+        "hh_size_3",
+        "hh_size_4",
+        "hh_size_5",
+        "hh_size_6plus",
+    ]
+
+    income_cols = [
+        "hh_income_lt_25k",
+        "hh_income_25k_50k",
+        "hh_income_50k_100k",
+        "hh_income_100k_plus",
+    ]
+
+    model_1 = _fit_ols(
+        df=df_reg,
+        y_col=y_col,
+        x_cols=["total_households"],
+        model_name="Model 1: Total Households Only",
+        include_intercept=True,
+    )
+
+    model_2 = _fit_ols(
+        df=df_reg,
+        y_col=y_col,
+        x_cols=size_cols,
+        model_name="Model 2: Household Size Counts, No Intercept",
+        include_intercept=False,
+    )
+
+    model_3 = _fit_ols(
+        df=df_reg,
+        y_col=y_col,
+        x_cols=income_cols,
+        model_name="Model 3: Income Category Counts, No Intercept",
+        include_intercept=False,
+    )
+
+    model_4 = _fit_ols(
+        df=df_reg,
+        y_col=y_col,
+        x_cols=size_cols + income_cols,
+        model_name="Model 4: Combined First-Pass Model, No Intercept",
+        include_intercept=False,
+    )
+
+    results = [model_1, model_2, model_3, model_4]
+
+    diagnostics = _build_step7_diagnostics(df_model, model_4)
+    diagnostics.to_csv(STEP7_COBB_DIAGNOSTICS_CSV, index=False)
+
+    report_lines = _step7_report_lines(results, diagnostics)
+    save_qa_report(report_lines, STEP7_COBB_RESULTS_TXT)
+
+    print(f"Saved Step 7 regression results: {STEP7_COBB_RESULTS_TXT}")
+    print(f"Saved Step 7 diagnostics: {STEP7_COBB_DIAGNOSTICS_CSV}")
+
+
+# ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
 
@@ -751,15 +1412,31 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run Step 5 Cobb ACS predictor prep + QA.",
     )
+    parser.add_argument(
+        "--step6-cobb",
+        action="store_true",
+        help="Run Step 6 Cobb modeling-table join + QA.",
+    )
+    parser.add_argument(
+        "--step7-cobb",
+        action="store_true",
+        help="Run Step 7 Cobb initial sanity-check regressions.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    # Default behavior: run Step 4 Cobb.
-    if not args.step1_cobb and not args.step4_cobb and not args.step5_cobb:
-        run_step_4_cobb()
+    # Default behavior: run Step 7 Cobb, auto-running earlier outputs if needed.
+    if (
+        not args.step1_cobb
+        and not args.step4_cobb
+        and not args.step5_cobb
+        and not args.step6_cobb
+        and not args.step7_cobb
+    ):
+        run_step_7_cobb()
     else:
         if args.step1_cobb:
             run_step_1_cobb()
@@ -767,3 +1444,7 @@ if __name__ == "__main__":
             run_step_4_cobb()
         if args.step5_cobb:
             run_step_5_cobb()
+        if args.step6_cobb:
+            run_step_6_cobb()
+        if args.step7_cobb:
+            run_step_7_cobb()

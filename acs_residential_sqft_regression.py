@@ -5,7 +5,7 @@ acs_residential_sqft_regression.py
 
 Estimate expected residential square feet per occupied household using ACS
 demographic and housing characteristics at the Census Block Group level for
-Cobb County.
+ARC counties.
 
 Regression specification:
     log(total_res_sqft_bg / occupied_households_bg)
@@ -38,8 +38,51 @@ ACS_YEAR = "2024"
 ACS_DATASET = "acs/acs5"
 STATE_FIPS = "13"
 
+# All 21 ARC counties (Georgia FIPS -> county name)
 COUNTIES = {
+    "013": "Barrow",
+    "015": "Bartow",
+    "035": "Carroll",
+    "045": "Cherokee",
+    "057": "Clayton",
+    "063": "Coweta",
     "067": "Cobb",
+    "077": "Dawson",
+    "085": "DeKalb",
+    "089": "Douglas",
+    "097": "Fayette",
+    "113": "Forsyth",
+    "117": "Fulton",
+    "121": "Gwinnett",
+    "135": "Henry",
+    "143": "Jasper",
+    "151": "Lamar",
+    "159": "Meriwether",
+    "217": "Newton",
+    "223": "Paulding",
+    "247": "Rockdale",
+}
+
+# 18 counties for which parcel-derived sqft data is available
+COUNTIES_WITH_PARCELS = {
+    "013": "Barrow",
+    "015": "Bartow",
+    "035": "Carroll",
+    "045": "Cherokee",
+    "057": "Clayton",
+    "063": "Coweta",
+    "067": "Cobb",
+    "077": "Dawson",
+    "085": "DeKalb",
+    "089": "Douglas",
+    "097": "Fayette",
+    "113": "Forsyth",
+    "117": "Fulton",
+    "121": "Gwinnett",
+    "135": "Henry",
+    "217": "Newton",
+    "223": "Paulding",
+    "247": "Rockdale",
 }
 
 OUTPUT_DIR = Path("outputs")
@@ -48,12 +91,12 @@ OUTPUT_DIR = Path("outputs")
 ARC_BG_RES_SQFT_CSV = OUTPUT_DIR / "arc_bg_res_sqft_2024.csv"
 
 # Outputs
-ACS_PREDICTORS_CSV = OUTPUT_DIR / "acs_sqft_predictors_cobb_2024.csv"
-ACS_PREDICTORS_QA_TXT = OUTPUT_DIR / "qa_acs_sqft_predictors_cobb_2024.txt"
-MODELING_TABLE_CSV = OUTPUT_DIR / "acs_sqft_modeling_table_cobb_2024.csv"
-MODELING_TABLE_QA_TXT = OUTPUT_DIR / "qa_acs_sqft_modeling_table_cobb_2024.txt"
-REGRESSION_RESULTS_TXT = OUTPUT_DIR / "acs_sqft_regression_results_cobb_2024.txt"
-REGRESSION_DIAGNOSTICS_CSV = OUTPUT_DIR / "acs_sqft_regression_diagnostics_cobb_2024.csv"
+ACS_PREDICTORS_CSV = OUTPUT_DIR / "acs_sqft_predictors_arc_2024.csv"
+ACS_PREDICTORS_QA_TXT = OUTPUT_DIR / "qa_acs_sqft_predictors_arc_2024.txt"
+MODELING_TABLE_CSV = OUTPUT_DIR / "acs_sqft_modeling_table_arc_2024.csv"
+MODELING_TABLE_QA_TXT = OUTPUT_DIR / "qa_acs_sqft_modeling_table_arc_2024.txt"
+REGRESSION_RESULTS_TXT = OUTPUT_DIR / "acs_sqft_regression_results_arc_2024.txt"
+REGRESSION_DIAGNOSTICS_CSV = OUTPUT_DIR / "acs_sqft_regression_diagnostics_arc_2024.csv"
 
 # Dependent variable column name
 Y_COL = "log_res_sqft_per_hh"
@@ -328,7 +371,7 @@ def _predictors_qa_lines(df: pd.DataFrame) -> list[str]:
     Build a QA report for the ACS predictors table.
     """
     lines = []
-    lines.append("ACS Sqft Regression Predictors QA Report - Cobb County Block Groups")
+    lines.append("ACS Sqft Regression Predictors QA Report - ARC Block Groups")
     lines.append("=" * 80)
     lines.append(f"ACS year: {ACS_YEAR}")
     lines.append(f"Rows: {len(df):,}")
@@ -443,7 +486,7 @@ def _build_modeling_table() -> pd.DataFrame:
 
 def _modeling_table_qa_lines(df: pd.DataFrame) -> list[str]:
     lines = []
-    lines.append("ACS Sqft Regression Modeling Table QA Report - Cobb County Block Groups")
+    lines.append("ACS Sqft Regression Modeling Table QA Report - ARC Block Groups")
     lines.append("=" * 80)
     lines.append(f"ACS year: {ACS_YEAR}")
     lines.append(f"Total block groups: {len(df):,}")
@@ -650,38 +693,358 @@ def _build_diagnostics(result: dict) -> pd.DataFrame:
     return pred_df
 
 
-def run_step_fit_regression() -> None:
+def run_step_fit_regression(model_scope: str = "all") -> None:
     """
     Load modeling table, fit weighted OLS, save results and diagnostics.
+
+    Parameters
+    ----------
+    model_scope : str
+        "all"       – fit one combined model across all ARC counties with
+                      parcel data (18 counties).
+        "by-county" – fit one model per county (only counties present in the
+                      modeling table, i.e. the 18 with parcel data).
     """
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     df = _load_modeling_table()
     df_reg = df[df[Y_COL].notna()].copy()
-
-    # Drop rows with any null predictor
     df_reg = df_reg.dropna(subset=PREDICTOR_COLS + ["occupied_households_bg"])
 
-    print(f"Fitting regression on {len(df_reg):,} block groups...")
+    if model_scope == "all":
+        print(f"Fitting one combined ARC model on {len(df_reg):,} block groups...")
 
+        result = _fit_wls(
+            df=df_reg,
+            y_col=Y_COL,
+            x_cols=PREDICTOR_COLS,
+            weight_col="occupied_households_bg",
+            model_name="ACS Residential Sqft Regression - All ARC Counties (WLS)",
+        )
+
+        report_lines = _format_regression_report(result)
+        _save_qa_report(report_lines, REGRESSION_RESULTS_TXT)
+        print(f"Saved regression results: {REGRESSION_RESULTS_TXT}")
+
+        diagnostics = _build_diagnostics(result)
+        diagnostics.to_csv(REGRESSION_DIAGNOSTICS_CSV, index=False)
+        print(f"Saved regression diagnostics: {REGRESSION_DIAGNOSTICS_CSV}")
+
+        for line in report_lines:
+            print(line)
+
+    elif model_scope == "by-county":
+        all_report_lines: list[str] = []
+        all_diagnostics: list[pd.DataFrame] = []
+
+        counties_in_data = sorted(df_reg["county_name"].dropna().unique())
+        print(
+            f"Fitting individual models for {len(counties_in_data)} counties "
+            f"({len(df_reg):,} block groups total)..."
+        )
+
+        for county_name in counties_in_data:
+            df_county = df_reg[df_reg["county_name"] == county_name].copy()
+            print(f"  {county_name}: {len(df_county):,} block groups")
+
+            result = _fit_wls(
+                df=df_county,
+                y_col=Y_COL,
+                x_cols=PREDICTOR_COLS,
+                weight_col="occupied_households_bg",
+                model_name=(
+                    f"ACS Residential Sqft Regression - {county_name} County (WLS)"
+                ),
+            )
+
+            county_slug = county_name.lower().replace(" ", "_")
+            county_results_path = (
+                OUTPUT_DIR / f"acs_sqft_regression_results_{county_slug}_2024.txt"
+            )
+            county_diag_path = (
+                OUTPUT_DIR / f"acs_sqft_regression_diagnostics_{county_slug}_2024.csv"
+            )
+
+            report_lines = _format_regression_report(result)
+            _save_qa_report(report_lines, county_results_path)
+            print(f"    Saved: {county_results_path}")
+
+            diagnostics = _build_diagnostics(result)
+            diagnostics.to_csv(county_diag_path, index=False)
+            print(f"    Saved: {county_diag_path}")
+
+            all_report_lines += report_lines + ["", ""]
+            all_diagnostics.append(diagnostics)
+
+        # Also save a combined summary file
+        _save_qa_report(all_report_lines, REGRESSION_RESULTS_TXT)
+        print(f"Saved combined regression results: {REGRESSION_RESULTS_TXT}")
+
+        combined_diag = pd.concat(all_diagnostics, ignore_index=True)
+        combined_diag.to_csv(REGRESSION_DIAGNOSTICS_CSV, index=False)
+        print(f"Saved combined regression diagnostics: {REGRESSION_DIAGNOSTICS_CSV}")
+
+    else:
+        raise ValueError(
+            f"Unknown model_scope '{model_scope}'. Choose 'all' or 'by-county'."
+        )
+
+
+# ---------------------------------------------------------------------
+# Example households & back-propagation
+# ---------------------------------------------------------------------
+
+# Output path for the back-propagation results
+BACKPROP_RESULTS_CSV = OUTPUT_DIR / "acs_sqft_backprop_households_2024.csv"
+BACKPROP_RESULTS_TXT = OUTPUT_DIR / "acs_sqft_backprop_households_2024.txt"
+
+# ---------------------------------------------------------------------------
+# Ten example household archetypes.
+#
+# Each entry is a dict with:
+#   label                            – human-readable name
+#   household_income                 – approximate annual household income ($)
+#   household_size                   – number of persons
+#   has_children                     – 1 if any children present, else 0
+#   structure_type                   – one of:
+#       "single_detached"  → share_single_attached_bg = 0 (single-family detached)
+#       "single_attached"  → share_single_attached_bg = 1 (townhouse / row-house)
+#       "2_to_4"           → share_2_to_4_units_bg    = 1
+#       "5_to_19"          → share_5_to_19_units_bg   = 1
+#       "20plus"           → share_20plus_units_bg     = 1
+#       "mobile_other"     → share_mobile_other_bg     = 1
+#   expected_bedrooms                – expected number of bedrooms
+#
+# The predictor values are computed from these inputs exactly as the ACS
+# block-group predictors are constructed:
+#   E_log_income_bg  = log(household_income)
+#   E_log_hhsize_bg  = log(household_size)
+#   share_*          = 0 or 1 (the household lives entirely in that structure type)
+# ---------------------------------------------------------------------------
+
+EXAMPLE_HOUSEHOLDS = [
+    {
+        "label": "Dual-income family, single-detached (4BR)",
+        "household_income": 120_000,
+        "household_size": 4,
+        "has_children": 1,
+        "structure_type": "single_detached",
+        "expected_bedrooms": 4,
+    },
+    {
+        "label": "Retired couple, mobile home (2BR)",
+        "household_income": 42_000,
+        "household_size": 2,
+        "has_children": 0,
+        "structure_type": "mobile_other",
+        "expected_bedrooms": 2,
+    },
+    {
+        "label": "Single professional, large apartment complex (1BR)",
+        "household_income": 65_000,
+        "household_size": 1,
+        "has_children": 0,
+        "structure_type": "20plus",
+        "expected_bedrooms": 1,
+    },
+    {
+        "label": "Young couple, townhouse / row-house (2BR)",
+        "household_income": 85_000,
+        "household_size": 2,
+        "has_children": 0,
+        "structure_type": "single_attached",
+        "expected_bedrooms": 2,
+    },
+    {
+        "label": "Large family, single-detached (5BR)",
+        "household_income": 95_000,
+        "household_size": 6,
+        "has_children": 1,
+        "structure_type": "single_detached",
+        "expected_bedrooms": 5,
+    },
+    {
+        "label": "Low-income single parent, small apartment (2BR)",
+        "household_income": 28_000,
+        "household_size": 3,
+        "has_children": 1,
+        "structure_type": "5_to_19",
+        "expected_bedrooms": 2,
+    },
+    {
+        "label": "Affluent empty-nesters, single-detached (3BR)",
+        "household_income": 200_000,
+        "household_size": 2,
+        "has_children": 0,
+        "structure_type": "single_detached",
+        "expected_bedrooms": 3,
+    },
+    {
+        "label": "Roommates, duplex / small multi-family (3BR)",
+        "household_income": 72_000,
+        "household_size": 3,
+        "has_children": 0,
+        "structure_type": "2_to_4",
+        "expected_bedrooms": 3,
+    },
+    {
+        "label": "Retired single, senior apartment complex (1BR)",
+        "household_income": 30_000,
+        "household_size": 1,
+        "has_children": 0,
+        "structure_type": "20plus",
+        "expected_bedrooms": 1,
+    },
+    {
+        "label": "Middle-income family, single-detached (3BR)",
+        "household_income": 75_000,
+        "household_size": 4,
+        "has_children": 1,
+        "structure_type": "single_detached",
+        "expected_bedrooms": 3,
+    },
+]
+
+
+def _household_to_predictor_row(hh: dict) -> dict:
+    """
+    Convert a household archetype dict into a predictor-vector row whose keys
+    match PREDICTOR_COLS.
+    """
+    structure = hh["structure_type"]
+    row = {
+        "E_log_income_bg": np.log(hh["household_income"]),
+        "E_log_hhsize_bg": np.log(hh["household_size"]),
+        "share_households_with_children_bg": float(hh["has_children"]),
+        "share_single_attached_bg": 1.0 if structure == "single_attached" else 0.0,
+        "share_2_to_4_units_bg": 1.0 if structure == "2_to_4" else 0.0,
+        "share_5_to_19_units_bg": 1.0 if structure == "5_to_19" else 0.0,
+        "share_20plus_units_bg": 1.0 if structure == "20plus" else 0.0,
+        "share_mobile_other_bg": 1.0 if structure == "mobile_other" else 0.0,
+        "expected_bedrooms_bg": float(hh["expected_bedrooms"]),
+    }
+    return row
+
+
+def run_step_backpropagate_households(model_scope: str = "all") -> None:
+    """
+    Load fitted regression coefficients from the modeling table, apply them to
+    each example household archetype, and back-transform to predicted square
+    feet per household.
+
+    The smearing factor (Duan, 1983) stored in the regression result is
+    re-derived here from the training residuals saved in the diagnostics CSV.
+    If the diagnostics file is not available the raw exp(log_sqft) estimate is
+    used instead.
+
+    Results are printed to stdout and saved to:
+        outputs/acs_sqft_backprop_households_2024.csv
+        outputs/acs_sqft_backprop_households_2024.txt
+    """
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # 1. Re-fit the model (or load coefficients from the diagnostics CSV)
+    # ------------------------------------------------------------------
+    df = _load_modeling_table()
+    df_reg = df[df[Y_COL].notna()].copy()
+    df_reg = df_reg.dropna(subset=PREDICTOR_COLS + ["occupied_households_bg"])
+
+    if model_scope == "by-county":
+        raise ValueError(
+            "back-propagation is only supported for model_scope='all'. "
+            "Run --fit-regression --model-scope all first."
+        )
+
+    print(f"Re-fitting combined ARC model on {len(df_reg):,} block groups for back-propagation...")
     result = _fit_wls(
         df=df_reg,
         y_col=Y_COL,
         x_cols=PREDICTOR_COLS,
         weight_col="occupied_households_bg",
-        model_name="ACS Residential Sqft Regression - Cobb County Block Groups (WLS)",
+        model_name="ACS Residential Sqft Regression - All ARC Counties (WLS)",
     )
 
-    report_lines = _format_regression_report(result)
-    _save_qa_report(report_lines, REGRESSION_RESULTS_TXT)
-    print(f"Saved regression results: {REGRESSION_RESULTS_TXT}")
+    coef_df = result["coefficients"].set_index("term")["coefficient"]
+    smearing = result["smearing_factor"]
 
-    diagnostics = _build_diagnostics(result)
-    diagnostics.to_csv(REGRESSION_DIAGNOSTICS_CSV, index=False)
-    print(f"Saved regression diagnostics: {REGRESSION_DIAGNOSTICS_CSV}")
+    # ------------------------------------------------------------------
+    # 2. Apply coefficients to each example household
+    # ------------------------------------------------------------------
+    records = []
+    for hh in EXAMPLE_HOUSEHOLDS:
+        pred_row = _household_to_predictor_row(hh)
+        log_sqft = coef_df["intercept"]
+        for col in PREDICTOR_COLS:
+            log_sqft += coef_df[col] * pred_row[col]
 
-    # Print summary to console
-    for line in report_lines:
+        predicted_sqft = np.exp(log_sqft) * smearing
+
+        records.append(
+            {
+                "label": hh["label"],
+                "household_income": hh["household_income"],
+                "household_size": hh["household_size"],
+                "has_children": hh["has_children"],
+                "structure_type": hh["structure_type"],
+                "expected_bedrooms": hh["expected_bedrooms"],
+                **pred_row,
+                "predicted_log_sqft_per_hh": float(log_sqft),
+                "predicted_sqft_per_hh": float(predicted_sqft),
+                "smearing_factor_used": smearing,
+            }
+        )
+
+    results_df = pd.DataFrame(records)
+
+    # ------------------------------------------------------------------
+    # 3. Save CSV
+    # ------------------------------------------------------------------
+    results_df.to_csv(BACKPROP_RESULTS_CSV, index=False)
+    print(f"Saved back-propagation results: {BACKPROP_RESULTS_CSV}")
+
+    # ------------------------------------------------------------------
+    # 4. Build and save human-readable report
+    # ------------------------------------------------------------------
+    report_lines = [
+        "Back-Propagation of Example Households through ACS Sqft Regression",
+        "=" * 80,
+        f"Model: {result['model_name']}",
+        f"Smearing factor (Duan 1983): {smearing:.6f}",
+        "",
+        f"{'#':<3}  {'Label':<52}  {'Income':>9}  {'Size':>4}  {'Kids':>4}  "
+        f"{'Structure':<16}  {'BR':>3}  {'Pred sqft/HH':>13}",
+        "-" * 120,
+    ]
+    for i, rec in enumerate(records, start=1):
+        report_lines.append(
+            f"{i:<3}  {rec['label']:<52}  ${rec['household_income']:>8,}  "
+            f"{rec['household_size']:>4}  {rec['has_children']:>4}  "
+            f"{rec['structure_type']:<16}  {rec['expected_bedrooms']:>3}  "
+            f"{rec['predicted_sqft_per_hh']:>13,.1f}"
+        )
+
+    report_lines += [
+        "",
+        "Predictor values used (back-propagated inputs)",
+        "-" * 80,
+    ]
+    for i, rec in enumerate(records, start=1):
+        report_lines.append(f"\n  [{i}] {rec['label']}")
+        for col in PREDICTOR_COLS:
+            report_lines.append(f"      {col:<42} = {rec[col]:.6f}")
+        report_lines.append(
+            f"      {'predicted_log_sqft_per_hh':<42} = {rec['predicted_log_sqft_per_hh']:.6f}"
+        )
+        report_lines.append(
+            f"      {'predicted_sqft_per_hh':<42} = {rec['predicted_sqft_per_hh']:,.1f}"
+        )
+
+    _save_qa_report(report_lines, BACKPROP_RESULTS_TXT)
+    print(f"Saved back-propagation report:  {BACKPROP_RESULTS_TXT}")
+
+    print()
+    for line in report_lines[:len(EXAMPLE_HOUSEHOLDS) + 8]:
         print(line)
 
 
@@ -692,7 +1055,7 @@ def run_step_fit_regression() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "ACS residential square footage regression for Cobb County block groups. "
+            "ACS residential square footage regression for ARC county block groups. "
             "Steps: build-predictors -> build-modeling-table -> fit-regression."
         )
     )
@@ -712,6 +1075,26 @@ def parse_args() -> argparse.Namespace:
         help="Fit weighted OLS regression and save results.",
     )
     parser.add_argument(
+        "--model-scope",
+        choices=["all", "by-county"],
+        default="all",
+        help=(
+            "Regression scope for --fit-regression (or --all): "
+            "'all' fits one combined model across all 18 ARC counties with parcel data; "
+            "'by-county' fits a separate model for each county individually. "
+            "Default: all."
+        ),
+    )
+    parser.add_argument(
+        "--backpropagate-households",
+        action="store_true",
+        help=(
+            "Apply fitted regression coefficients to the 10 example household "
+            "archetypes and back-transform to predicted sqft per household. "
+            "Requires the modeling table to exist (run --build-modeling-table first)."
+        ),
+    )
+    parser.add_argument(
         "--all",
         action="store_true",
         help="Run all steps in sequence.",
@@ -723,7 +1106,10 @@ if __name__ == "__main__":
     args = parse_args()
 
     run_all = args.all or not (
-        args.build_predictors or args.build_modeling_table or args.fit_regression
+        args.build_predictors
+        or args.build_modeling_table
+        or args.fit_regression
+        or args.backpropagate_households
     )
 
     if args.build_predictors or run_all:
@@ -733,4 +1119,7 @@ if __name__ == "__main__":
         run_step_build_modeling_table()
 
     if args.fit_regression or run_all:
-        run_step_fit_regression()
+        run_step_fit_regression(model_scope=args.model_scope)
+
+    if args.backpropagate_households or run_all:
+        run_step_backpropagate_households()

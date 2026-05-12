@@ -625,6 +625,7 @@ def _fit_wls(
     smearing_factor = float(np.mean(np.exp(residual)))
 
     prediction_df = model_df[["GEOID", y_col, weight_col]].copy()
+    prediction_df = prediction_df.rename(columns={"GEOID": "geoid"})
     prediction_df["predicted_log_sqft_per_hh"] = predicted
     prediction_df["residual"] = residual
     prediction_df["predicted_sqft_per_hh"] = np.exp(predicted) * smearing_factor

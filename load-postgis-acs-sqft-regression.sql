@@ -22,22 +22,7 @@ CREATE TABLE acs_5yr_2024.acs_sqft_regression_diagnostics_arc_2024 (
   abs_pct_error                 double precision
 );
 
-\copy acs_5yr_2024.acs_sqft_regression_diagnostics_arc_2024 (
-  geoid,
-  log_res_sqft_per_hh,
-  occupied_households_bg,
-  predicted_log_sqft_per_hh,
-  residual,
-  predicted_sqft_per_hh,
-  model_name,
-  abs_residual,
-  abs_pct_error
-)
-FROM '/nfs/home/sja/repos/census_pecas_download/outputs/acs_sqft_regression_diagnostics_arc_2024.csv'
-WITH (FORMAT csv, HEADER true);
-
-CREATE INDEX acs_sqft_regression_diagnostics_arc_2024_geoid_idx
-ON acs_5yr_2024.acs_sqft_regression_diagnostics_arc_2024 (geoid);
+\copy acs_5yr_2024.acs_sqft_regression_diagnostics_arc_2024 (geoid, log_res_sqft_per_hh, occupied_households_bg, predicted_log_sqft_per_hh, residual, predicted_sqft_per_hh, model_name, abs_residual, abs_pct_error) FROM '/nfs/home/sja/repos/census_pecas_download/outputs/acs_sqft_regression_diagnostics_arc_2024.csv' WITH (FORMAT csv, HEADER true);
 
 ANALYZE acs_5yr_2024.acs_sqft_regression_diagnostics_arc_2024;
 
@@ -50,7 +35,8 @@ DROP VIEW IF EXISTS acs_5yr_2024.v_acs_sqft_regression_diagnostics_arc_2024;
 
 CREATE VIEW acs_5yr_2024.v_acs_sqft_regression_diagnostics_arc_2024 AS
 SELECT
-  g.geom,
+  row_number() OVER () AS gid,
+  g.geom::geometry(MultiPolygon, 4326) AS geom,
   g.state,
   g.county,
   g.tract,

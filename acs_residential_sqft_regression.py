@@ -3,12 +3,12 @@
 """
 acs_residential_sqft_regression.py
 
-Estimate expected residential square feet per occupied household using ACS
-demographic and housing characteristics at the Census Block Group level for
-ARC counties.
+Estimate expected residential square feet per dwelling (occupied and
+unoccupied) using ACS demographic and housing characteristics at the Census
+Block Group level for ARC counties.
 
 Regression specification:
-    log(total_res_sqft_bg / occupied_households_bg)
+    log(total_res_sqft_bg / total_housing_units_bg)
     ~
     E_log_income_bg
     + E_log_hhsize_bg
@@ -20,11 +20,12 @@ Regression specification:
     + share_mobile_other_bg
     + expected_bedrooms_bg
 
-Weighted by occupied_households_bg (B25003_001E).
+Weighted by total_housing_units_bg (B25001_001E).
 """
 
 from pathlib import Path
 import argparse
+import os
 import numpy as np
 import pandas as pd
 import requests
@@ -99,7 +100,7 @@ REGRESSION_RESULTS_TXT = OUTPUT_DIR / "acs_sqft_regression_results_arc_2024.txt"
 REGRESSION_DIAGNOSTICS_CSV = OUTPUT_DIR / "acs_sqft_regression_diagnostics_arc_2024.csv"
 
 # Dependent variable column name
-Y_COL = "log_res_sqft_per_hh"
+Y_COL = "log_res_sqft_per_dwelling"
 
 # Predictor column names (matches specification)
 PREDICTOR_COLS = [
@@ -172,6 +173,55 @@ B25041_BINS = [
 # Helpers
 # ---------------------------------------------------------------------
 
+def _load_env_file(path: Path) -> None:
+    """
+    Lightweight loader for shell-style `KEY=VALUE` (optionally prefixed with
+    `export `) files. Only sets variables that are not already present in the
+    current process environment, so anything exported in the shell wins.
+    """
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _get_census_api_key() -> str:
+    """
+    Return the Census API key, auto-loading `config/leduc-secrets.env` if
+    needed. Raises a clear error if the key is missing or obviously malformed.
+    """
+    key = os.environ.get("CENSUS_API_KEY", "").strip()
+    if not key:
+        _load_env_file(Path(__file__).resolve().parent / "config" / "leduc-secrets.env")
+        key = os.environ.get("CENSUS_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError(
+            "CENSUS_API_KEY is not set. Request a key at "
+            "https://api.census.gov/data/key_signup.html and either export it "
+            "in your shell (`export CENSUS_API_KEY=...`) or add it to "
+            "config/leduc-secrets.env."
+        )
+    # Census keys are 40-char lowercase hex strings. Catch common mistakes
+    # (quoting, trailing whitespace, accidental concatenation) up front.
+    if not (len(key) == 40 and all(c in "0123456789abcdef" for c in key.lower())):
+        raise RuntimeError(
+            f"CENSUS_API_KEY looks malformed (length={len(key)}, value={key!r}). "
+            "Expected a 40-character hex string with no quotes or whitespace."
+        )
+    return key
+
+
 def _make_geoid(df: pd.DataFrame) -> pd.Series:
     """
     Build 12-character block group GEOID from state/county/tract/block group columns.
@@ -201,6 +251,8 @@ def _fetch_acs_table(
         "in": f"state:{STATE_FIPS} county:{county_fips}",
     }
 
+    params["key"] = _get_census_api_key()
+
     response = requests.get(url, params=params, timeout=60)
     if response.status_code != 200:
         raise RuntimeError(
@@ -208,7 +260,39 @@ def _fetch_acs_table(
             f"HTTP {response.status_code}: {response.text[:500]}"
         )
 
-    data = response.json()
+    # The Census API returns HTTP 200 with an HTML page for both "Missing Key"
+    # and "Invalid Key" errors, so sniff the body before parsing JSON.
+    body = response.text
+    ctype = response.headers.get("Content-Type", "")
+    if "json" not in ctype.lower() or body.lstrip().startswith("<"):
+        snippet = body[:500]
+        if "Invalid Key" in body:
+            hint = (
+                " The CENSUS_API_KEY value was rejected by the Census API. "
+                "Verify the key at https://api.census.gov/data/key_signup.html "
+                "(activation email must have been clicked) and confirm the "
+                "value reaching this process matches it exactly."
+            )
+        elif "Missing Key" in body:
+            hint = (
+                " The Census API requires an API key. Request one at "
+                "https://api.census.gov/data/key_signup.html and set the "
+                "CENSUS_API_KEY environment variable."
+            )
+        else:
+            hint = ""
+        raise RuntimeError(
+            f"Non-JSON response from Census API for group={group}, "
+            f"county={county_fips}: {snippet}{hint}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Non-JSON response from Census API for group={group}, "
+            f"county={county_fips}: {response.text[:500]}"
+        ) from exc
     df = pd.DataFrame(data[1:], columns=data[0])
     df["GEOID"] = _make_geoid(df)
     return df
@@ -253,11 +337,11 @@ def _build_acs_predictors() -> pd.DataFrame:
     Returns a DataFrame with GEOID and all predictor columns.
     """
 
-    # --- B25003: Occupied housing units (denominator weight) ---
-    b25003_vars = ["B25003_001E"]
-    print("Fetching B25003 (Tenure / occupied households)...")
-    df_tenure = _fetch_acs_table_arc("B25003", b25003_vars)
-    df_tenure = _to_numeric(df_tenure, b25003_vars)
+    # --- B25001: Total housing units (denominator weight, occupied + unoccupied) ---
+    b25001_vars = ["B25001_001E"]
+    print("Fetching B25001 (Total housing units)...")
+    df_tenure = _fetch_acs_table_arc("B25001", b25001_vars)
+    df_tenure = _to_numeric(df_tenure, b25001_vars)
 
     # --- B19001: Household income distribution ---
     b19001_vars = [f"B19001_{s}" for s, _, _ in B19001_BINS]
@@ -297,7 +381,7 @@ def _build_acs_predictors() -> pd.DataFrame:
     df_beds = _to_numeric(df_beds, b25041_vars + [b25041_total])
 
     # --- Merge all tables on GEOID ---
-    df = df_tenure[["GEOID", "county_name", "state", "county", "tract", "block group", "B25003_001E"]].copy()
+    df = df_tenure[["GEOID", "county_name", "state", "county", "tract", "block group", "B25001_001E"]].copy()
 
     for other, cols in [
         (df_income,   b19001_vars + [b19001_total]),
@@ -354,12 +438,12 @@ def _build_acs_predictors() -> pd.DataFrame:
         e_bedrooms += share * midpoint
     df["expected_bedrooms_bg"] = np.where(beds_total.notna(), e_bedrooms, np.nan)
 
-    # --- Rename occupied households column for clarity ---
-    df = df.rename(columns={"B25003_001E": "occupied_households_bg"})
+    # --- Rename total housing units column for clarity ---
+    df = df.rename(columns={"B25001_001E": "total_housing_units_bg"})
 
     keep_cols = (
         ["GEOID", "county_name", "state", "county", "tract", "block group",
-         "occupied_households_bg"]
+         "total_housing_units_bg"]
         + PREDICTOR_COLS
     )
 
@@ -392,7 +476,7 @@ def _predictors_qa_lines(df: pd.DataFrame) -> list[str]:
     lines.append("")
 
     lines.append("Predictor summary statistics:")
-    for col in ["occupied_households_bg"] + PREDICTOR_COLS:
+    for col in ["total_housing_units_bg"] + PREDICTOR_COLS:
         if col not in df.columns:
             lines.append(f"  {col}: MISSING")
             continue
@@ -437,7 +521,7 @@ def _load_acs_predictors() -> pd.DataFrame:
             "Run --build-predictors first."
         )
     df = pd.read_csv(ACS_PREDICTORS_CSV, dtype={"GEOID": str})
-    for col in ["occupied_households_bg"] + PREDICTOR_COLS:
+    for col in ["total_housing_units_bg"] + PREDICTOR_COLS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
@@ -462,9 +546,9 @@ def _build_modeling_table() -> pd.DataFrame:
     Join parcel-derived sqft with ACS predictors and compute the dependent variable.
 
     Dependent variable:
-        log(total_residential_sqft_bg / occupied_households_bg)
+        log(total_residential_sqft_bg / total_housing_units_bg)
 
-    Only block groups with occupied_households_bg > 0 and
+    Only block groups with total_housing_units_bg > 0 and
     total_residential_sqft_bg > 0 are included.
     """
     df_sqft = _load_arc_bg_res_sqft()
@@ -474,10 +558,10 @@ def _build_modeling_table() -> pd.DataFrame:
     df["total_residential_sqft_bg"] = df["total_residential_sqft_bg"].fillna(0)
 
     # Compute dependent variable
-    valid = (df["occupied_households_bg"] > 0) & (df["total_residential_sqft_bg"] > 0)
+    valid = (df["total_housing_units_bg"] > 0) & (df["total_residential_sqft_bg"] > 0)
     df[Y_COL] = np.where(
         valid,
-        np.log(df["total_residential_sqft_bg"] / df["occupied_households_bg"]),
+        np.log(df["total_residential_sqft_bg"] / df["total_housing_units_bg"]),
         np.nan,
     )
 
@@ -492,13 +576,13 @@ def _modeling_table_qa_lines(df: pd.DataFrame) -> list[str]:
     lines.append(f"Total block groups: {len(df):,}")
 
     n_valid = df[Y_COL].notna().sum()
-    n_zero_sqft = (df["total_residential_sqft_bg"] == 0).sum()
-    n_zero_hh = (df["occupied_households_bg"] == 0).sum()
     n_null_y = df[Y_COL].isna().sum()
+    n_zero_sqft = (df["total_residential_sqft_bg"] == 0).sum()
+    n_zero_hh = (df["total_housing_units_bg"] == 0).sum()
 
     lines.append(f"Block groups with valid dependent variable: {n_valid:,}")
     lines.append(f"Block groups with zero residential sqft: {n_zero_sqft:,}")
-    lines.append(f"Block groups with zero occupied households: {n_zero_hh:,}")
+    lines.append(f"Block groups with zero total housing units: {n_zero_hh:,}")
     lines.append(f"Block groups excluded (null dependent variable): {n_null_y:,}")
     lines.append("")
 
@@ -543,7 +627,7 @@ def _load_modeling_table() -> pd.DataFrame:
             "Run --build-modeling-table first."
         )
     df = pd.read_csv(MODELING_TABLE_CSV, dtype={"GEOID": str})
-    for col in [Y_COL, "occupied_households_bg", "total_residential_sqft_bg"] + PREDICTOR_COLS:
+    for col in [Y_COL, "total_housing_units_bg", "total_residential_sqft_bg"] + PREDICTOR_COLS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
@@ -710,7 +794,7 @@ def run_step_fit_regression(model_scope: str = "all") -> None:
 
     df = _load_modeling_table()
     df_reg = df[df[Y_COL].notna()].copy()
-    df_reg = df_reg.dropna(subset=PREDICTOR_COLS + ["occupied_households_bg"])
+    df_reg = df_reg.dropna(subset=PREDICTOR_COLS + ["total_housing_units_bg"])
 
     if model_scope == "all":
         print(f"Fitting one combined ARC model on {len(df_reg):,} block groups...")
@@ -719,7 +803,7 @@ def run_step_fit_regression(model_scope: str = "all") -> None:
             df=df_reg,
             y_col=Y_COL,
             x_cols=PREDICTOR_COLS,
-            weight_col="occupied_households_bg",
+            weight_col="total_housing_units_bg",
             model_name="ACS Residential Sqft Regression - All ARC Counties (WLS)",
         )
 
@@ -752,7 +836,7 @@ def run_step_fit_regression(model_scope: str = "all") -> None:
                 df=df_county,
                 y_col=Y_COL,
                 x_cols=PREDICTOR_COLS,
-                weight_col="occupied_households_bg",
+                weight_col="total_housing_units_bg",
                 model_name=(
                     f"ACS Residential Sqft Regression - {county_name} County (WLS)"
                 ),
@@ -949,7 +1033,7 @@ def run_step_backpropagate_households(model_scope: str = "all") -> None:
     # ------------------------------------------------------------------
     df = _load_modeling_table()
     df_reg = df[df[Y_COL].notna()].copy()
-    df_reg = df_reg.dropna(subset=PREDICTOR_COLS + ["occupied_households_bg"])
+    df_reg = df_reg.dropna(subset=PREDICTOR_COLS + ["total_housing_units_bg"])
 
     if model_scope == "by-county":
         raise ValueError(
@@ -962,7 +1046,7 @@ def run_step_backpropagate_households(model_scope: str = "all") -> None:
         df=df_reg,
         y_col=Y_COL,
         x_cols=PREDICTOR_COLS,
-        weight_col="occupied_households_bg",
+        weight_col="total_housing_units_bg",
         model_name="ACS Residential Sqft Regression - All ARC Counties (WLS)",
     )
 

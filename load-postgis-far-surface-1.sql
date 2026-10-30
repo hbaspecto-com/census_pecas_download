@@ -5,8 +5,9 @@
 -- suitable for loading into QGIS.
 --
 -- Implements the design described in docs/Kernel_Map_Of_FAR.md:
---   - All parcels (not just residential) contribute to the surface
---   - Effective land area is capped to prevent large parks/farms from
+--   - Only residential parcels (pecas_resi_tranche_mr in the standard
+--     residential tranches) contribute to the surface
+--   - Effective land area is capped to prevent large parcels from
 --     dominating the denominator
 --   - A Gaussian distance-decay kernel smooths FAR over a 1200m search radius
 --     with a 400m kernel scale (dense urban / suburban setting)
@@ -73,7 +74,14 @@ SELECT
     geom
 FROM acs_5yr_2024.arc_parcels_2024
 WHERE geom IS NOT NULL
-  AND NOT ST_IsEmpty(geom);
+  AND NOT ST_IsEmpty(geom)
+  AND pecas_resi_tranche_mr IN (
+      'SFR LESS THAN 1 ACRE',
+      'SFR 1 ACRE OR MORE',
+      'CONDO TOWNHOME DUPLEX TRIPLEX QUADPLEX',
+      'MFR LESS THAN 3 FLOORS',
+      'MFR 3 FLOORS OR MORE'
+  );
 --  AND parcel_acreage_mr IS NOT NULL
 --  AND parcel_acreage_mr > 0;
 
